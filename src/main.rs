@@ -76,6 +76,11 @@ struct App {
     release: RefCell<Option<update::Release>>,
     status: nwg::Label,
     account: nwg::Label,
+    ranks: nwg::Label,
+    matches_heading: nwg::Label,
+    detail_heading: nwg::Label,
+    account_font: nwg::Font,
+    section_font: nwg::Font,
     list: nwg::ListView,
     detail: nwg::TextBox,
     notice: nwg::Notice,
@@ -134,13 +139,38 @@ impl App {
         });
     }
 
+    fn layout(&self) {
+        let (width, height) = self.window.size();
+        let content = width.saturating_sub(48).max(1);
+        let action_left = width.saturating_sub(158) as i32;
+        self.sync.set_position(action_left, 24);
+        self.update_button.set_position(action_left - 134, 24);
+        self.account
+            .set_size(content.saturating_sub(270).max(1), 34);
+        self.ranks.set_size(content, 24);
+        self.status.set_size(content, 24);
+        let list_height = (height.saturating_sub(218) * 3 / 5).max(66);
+        self.list.set_size(content, list_height);
+        let detail_top = 164 + list_height;
+        self.detail_heading.set_position(24, detail_top as i32 + 7);
+        self.details_button
+            .set_position(width.saturating_sub(126) as i32, detail_top as i32);
+        self.detail.set_position(24, detail_top as i32 + 42);
+        self.detail
+            .set_size(content, height.saturating_sub(detail_top + 64).max(1));
+        for (index, share) in [20, 19, 15, 15, 13, 18].into_iter().enumerate() {
+            self.list
+                .set_column_width(index, (content.saturating_sub(20) * share / 100) as isize);
+        }
+    }
+
     fn render(&self) {
         let cache = self.cache.borrow();
         self.list.clear();
         if let Some(snapshot) = cache.current() {
-            self.account.set_text(&format!(
-                "{}  ·  等级 {}  ·  {}",
-                snapshot.name,
+            self.account.set_text(&snapshot.name);
+            self.ranks.set_text(&format!(
+                "等级 {}     {}",
                 snapshot.level,
                 snapshot.ranks.join("     ")
             ));
@@ -177,7 +207,8 @@ impl App {
                 );
             }
         } else {
-            self.account.set_text("尚未同步账号");
+            self.account.set_text("尚未连接");
+            self.ranks.set_text("");
             self.status
                 .set_text("请先登录游戏大厅，再点击「连接并同步」。");
         }
@@ -228,7 +259,7 @@ impl App {
         match reply {
             Reply::Snapshot(snapshot) => {
                 self.cache.borrow_mut().merge(*snapshot);
-                self.detail.set_text("");
+                self.detail.set_text("选择一场对局后，点击「查看详情」。");
                 self.render();
             }
             Reply::Detail(details) => {
@@ -271,6 +302,11 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
         release: RefCell::new(None),
         status: Default::default(),
         account: Default::default(),
+        ranks: Default::default(),
+        matches_heading: Default::default(),
+        detail_heading: Default::default(),
+        account_font: Default::default(),
+        section_font: Default::default(),
         list: Default::default(),
         detail: Default::default(),
         notice: Default::default(),
@@ -279,39 +315,65 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
         rx,
     };
     nwg::Window::builder()
-        .size((790, 635))
-        .position((100, 100))
+        .size((850, 690))
+        .center(true)
         .title("国服战绩查询")
         .flags(nwg::WindowFlags::MAIN_WINDOW)
         .build(&mut app.window)?;
+    nwg::Font::builder()
+        .family("Microsoft YaHei UI")
+        .size(20)
+        .weight(600)
+        .build(&mut app.account_font)?;
+    nwg::Font::builder()
+        .family("Microsoft YaHei UI")
+        .size(11)
+        .weight(600)
+        .build(&mut app.section_font)?;
     nwg::Button::builder()
         .text("连接并同步")
-        .size((130, 32))
-        .position((16, 13))
+        .size((134, 36))
         .parent(&app.window)
         .build(&mut app.sync)?;
     nwg::Button::builder()
-        .text("单局详情")
-        .size((98, 32))
-        .position((154, 13))
+        .text("查看详情")
+        .size((102, 30))
         .parent(&app.window)
         .build(&mut app.details_button)?;
     nwg::Label::builder()
-        .size((752, 27))
-        .position((16, 54))
+        .position((24, 20))
+        .font(Some(&app.account_font))
         .parent(&app.window)
         .build(&mut app.account)?;
     nwg::Label::builder()
-        .size((752, 24))
-        .position((16, 83))
+        .position((25, 62))
+        .parent(&app.window)
+        .build(&mut app.ranks)?;
+    nwg::Label::builder()
+        .position((25, 91))
         .parent(&app.window)
         .build(&mut app.status)?;
+    nwg::Label::builder()
+        .text("近期战绩")
+        .position((24, 118))
+        .size((160, 25))
+        .font(Some(&app.section_font))
+        .parent(&app.window)
+        .build(&mut app.matches_heading)?;
+    nwg::Label::builder()
+        .text("对局详情")
+        .size((160, 25))
+        .font(Some(&app.section_font))
+        .parent(&app.window)
+        .build(&mut app.detail_heading)?;
     nwg::ListView::builder()
-        .size((752, 285))
-        .position((16, 111))
+        .size((802, 285))
+        .position((24, 147))
         .parent(&app.window)
         .list_style(nwg::ListViewStyle::Detailed)
-        .ex_flags(nwg::ListViewExFlags::FULL_ROW_SELECT | nwg::ListViewExFlags::GRID)
+        .background_color([255, 255, 255])
+        .text_color([30, 41, 59])
+        .ex_flags(nwg::ListViewExFlags::FULL_ROW_SELECT)
         .build(&mut app.list)?;
     for (label, width) in [
         ("时间", 132),
@@ -328,7 +390,8 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
         });
     }
     nwg::TextBox::builder()
-        .size((752, 206))
+        .text("选择一场对局后，点击「查看详情」。")
+        .size((802, 206))
         .position((16, 408))
         .parent(&app.window)
         .readonly(true)
@@ -346,19 +409,22 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
         .build(&mut app.update_notice)?;
     nwg::Button::builder()
         .text("检查更新")
-        .size((151, 32))
+        .size((122, 36))
         .position((617, 13))
         .parent(&app.window)
         .build(&mut app.update_button)?;
     app.update_button.set_visible(false);
     let app = Rc::new(app);
+    app.layout();
     app.render();
     let weak = Rc::downgrade(&app);
-    let handler = nwg::full_bind_event_handler(&app.window.handle, move |event, _, handle| {
+    let handler = nwg::full_bind_event_handler(&app.window.handle, move |event, data, handle| {
         use nwg::Event::*;
         let Some(app) = weak.upgrade() else { return };
         match event {
             OnWindowClose if handle == app.window => nwg::stop_thread_dispatch(),
+            OnMinMaxInfo if handle == app.window => data.on_min_max().set_min_size(650, 500),
+            OnResize | OnWindowMaximize if handle == app.window => app.layout(),
             OnButtonClick if handle == app.sync => app.request(Request::Sync, None),
             OnButtonClick if handle == app.details_button => app.open_detail(),
             OnListViewItemActivated if handle == app.list => app.open_detail(),
