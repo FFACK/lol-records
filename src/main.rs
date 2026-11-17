@@ -230,8 +230,15 @@ impl App {
         self.sync.set_enabled(true);
         self.details_button.set_enabled(true);
         match reply {
-            Reply::Snapshot(snapshot) => {
-                self.cache.borrow_mut().merge(snapshot);
+            Reply::Snapshot(snapshot, details) => {
+                let mut cache = self.cache.borrow_mut();
+                for (id, detail) in details {
+                    cache
+                        .details
+                        .insert(format!("{}:{id}", snapshot.account), detail);
+                }
+                cache.merge(*snapshot);
+                drop(cache);
                 self.detail.set_text("");
                 self.render();
             }
