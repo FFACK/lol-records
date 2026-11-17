@@ -87,8 +87,15 @@ pub fn elevated(request: Request) -> Result<Reply, String> {
         let mut data = Vec::new();
         let mut buffer = [0u8; 8192];
         loop {
+            let worker_exited = unsafe { WaitForSingleObject(info.hProcess, 0) } == 0;
             match stream.read(&mut buffer) {
-                Ok(0) => break,
+                // Windows may report an empty read while the worker is still querying LCU.
+                Ok(0) => {
+                    if worker_exited {
+                        return Err("管理员同步进程退出前未返回完整结果。");
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
                 Ok(n) => {
                     data.extend_from_slice(&buffer[..n]);
                     if data.len() > 2 * 1024 * 1024 {
@@ -98,7 +105,13 @@ pub fn elevated(request: Request) -> Result<Reply, String> {
                         break;
                     }
                 }
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                Err(error)
+                    if error.kind() == ErrorKind::WouldBlock
+                        || error.raw_os_error() == Some(232) =>
+                {
+                    if worker_exited {
+                        return Err("管理员同步进程退出前未返回完整结果。");
+                    }
                     thread::sleep(Duration::from_millis(50))
                 }
                 Err(_) => return Err("同步通道读取失败。"),
