@@ -34,10 +34,57 @@ pub struct Snapshot {
     pub synced: i64,
     pub matches: Vec<Match>,
 }
+#[derive(Clone, Deserialize, Serialize)]
+pub struct Participant {
+    pub participant_id: Option<u64>,
+    pub team_id: Option<u64>,
+    pub champion_id: Option<u64>,
+    pub win: Option<bool>,
+    pub kills: Option<u64>,
+    pub deaths: Option<u64>,
+    pub assists: Option<u64>,
+    pub cs: Option<u64>,
+    pub items: [Option<u64>; 7],
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct Detail {
+    pub game_id: u64,
+    pub duration_seconds: Option<u64>,
+    pub teams: Vec<u64>,
+    pub participants: Vec<Participant>,
+    pub self_id: Option<u64>,
+    #[serde(default)]
+    pub platform: Option<String>,
+    #[serde(default)]
+    pub account_puuid: Option<String>,
+}
+
+impl Detail {
+    pub fn score(&self) -> Option<(u64, u64)> {
+        if self.teams != [100, 200] || self.participants.len() != 10 {
+            return None;
+        }
+        let sum = |team| {
+            let mut count = 0;
+            let total = self
+                .participants
+                .iter()
+                .filter(|p| p.team_id == Some(team))
+                .try_fold(0u64, |total, p| {
+                    count += 1;
+                    total.checked_add(p.kills?)
+                })?;
+            (count == 5).then_some(total)
+        };
+        Some((sum(100)?, sum(200)?))
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 pub enum Reply {
     Snapshot(Box<Snapshot>),
-    Detail(String),
+    Detail(Box<Detail>),
     AccessDenied,
     Error(String),
 }
@@ -231,42 +278,93 @@ exit 4
         })
     }
 
-    fn detail(&self, id: u64) -> Result<String, Reply> {
+    fn detail(&self, id: u64) -> Result<Detail, Reply> {
         let game = self.get(&format!("/lol-match-history/v1/games/{id}"))?;
-        let players = game["participants"]
-            .as_array()
-            .ok_or_else(|| Reply::Error("单局详情缺少参赛者数据。".into()))?;
-        let mut lines = vec![
-            format!(
-                "对局时长 {} 分 {} 秒",
-                number(&game["gameDuration"]) / 60,
-                number(&game["gameDuration"]) % 60
-            ),
-            String::new(),
-        ];
-        for player in players {
-            let team = number(&player["teamId"]);
-            let champion = number(&player["championId"]);
-            if let Some(stats) = stats(&player["stats"]) {
-                lines.push(format!(
-                    "{}  英雄 {}  {} / {} / {}  补刀 {}  装备 {}",
-                    if team == 100 { "蓝方" } else { "红方" },
-                    champion,
-                    stats.kills,
-                    stats.deaths,
-                    stats.assists,
-                    stats.cs,
-                    stats
-                        .items
-                        .iter()
-                        .map(u64::to_string)
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                ));
-            }
+        if game["gameId"].as_u64().is_some_and(|game_id| game_id != id) {
+            return Err(Reply::Error("客户端返回了其他对局。".into()));
         }
-        Ok(lines.join("\r\n"))
+        let account = self.get("/lol-summoner/v1/current-summoner").ok();
+        parse_detail(id, &game, account.as_ref())
+            .ok_or_else(|| Reply::Error("单局详情缺少参赛者数据。".into()))
     }
+}
+
+fn parse_detail(id: u64, game: &Value, account: Option<&Value>) -> Option<Detail> {
+    let account_puuid = account
+        .and_then(|account| account["puuid"].as_str())
+        .filter(|value| !value.is_empty());
+    let self_id = account.and_then(|account| {
+        let mut matches = game["participantIdentities"]
+            .as_array()?
+            .iter()
+            .filter(|row| {
+                let player = &row["player"];
+                account_puuid.is_some_and(|puuid| player["puuid"].as_str() == Some(puuid))
+                    || (account["summonerId"]
+                        .as_u64()
+                        .is_some_and(|id| id != 0 && player["summonerId"].as_u64() == Some(id)))
+            })
+            .filter_map(|row| row["participantId"].as_u64());
+        let id = matches.next()?;
+        matches.next().is_none().then_some(id)
+    });
+    let participants: Vec<_> = game["participants"]
+        .as_array()?
+        .iter()
+        .filter(|p| p.is_object())
+        .map(|p| {
+            let stats = &p["stats"];
+            let lane = stats["totalMinionsKilled"].as_u64();
+            let jungle = stats["neutralMinionsKilled"].as_u64();
+            Participant {
+                participant_id: p["participantId"].as_u64(),
+                team_id: p["teamId"].as_u64().filter(|id| *id != 0),
+                champion_id: p["championId"].as_u64().filter(|id| *id != 0),
+                win: stats["win"].as_bool(),
+                kills: stats["kills"].as_u64(),
+                deaths: stats["deaths"].as_u64(),
+                assists: stats["assists"].as_u64(),
+                cs: match (lane, jungle) {
+                    (Some(lane), Some(jungle)) => lane.checked_add(jungle),
+                    (value, None) | (None, value) => value,
+                },
+                items: std::array::from_fn(|slot| {
+                    stats[format!("item{slot}")].as_u64().filter(|id| *id != 0)
+                }),
+            }
+        })
+        .collect();
+    if participants.is_empty() {
+        return None;
+    }
+    let mut teams: Vec<u64> = game["teams"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|team| team["teamId"].as_u64().filter(|id| *id != 0))
+        .chain(participants.iter().filter_map(|p| p.team_id))
+        .collect();
+    teams.sort_unstable();
+    teams.dedup();
+    let self_id = self_id.filter(|id| {
+        participants
+            .iter()
+            .filter(|p| p.participant_id == Some(*id))
+            .count()
+            == 1
+    });
+    Some(Detail {
+        game_id: id,
+        duration_seconds: game["gameDuration"].as_u64(),
+        teams,
+        participants,
+        self_id,
+        platform: game["platformId"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned),
+        account_puuid: account_puuid.map(str::to_owned),
+    })
 }
 
 fn string(value: &Value) -> &str {
@@ -293,8 +391,58 @@ pub fn run(request: Request) -> Reply {
         Request::Sync => session
             .sync()
             .map(|snapshot| Reply::Snapshot(Box::new(snapshot))),
-        Request::Detail(id) => session.detail(id).map(Reply::Detail),
+        Request::Detail(id) => session
+            .detail(id)
+            .map(|detail| Reply::Detail(Box::new(detail))),
     }) {
         Ok(reply) | Err(reply) => reply,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn standard_score_requires_all_ten_players_and_known_kills() {
+        let players: Vec<_> = (1..=10)
+            .map(|id| {
+                json!({
+                    "participantId": id, "teamId": if id <= 5 { 100 } else { 200 },
+                    "championId": 22, "stats": {"kills": 0}
+                })
+            })
+            .collect();
+        let mut game = json!({"participants": players});
+        assert_eq!(parse_detail(42, &game, None).unwrap().score(), Some((0, 0)));
+        game["participants"][0]["stats"]["kills"] = Value::Null;
+        assert_eq!(parse_detail(42, &game, None).unwrap().score(), None);
+    }
+
+    #[test]
+    fn preserves_other_teams_and_optional_stats_and_item_slots() {
+        let game = json!({
+            "gameDuration": 0,
+            "participantIdentities": [{"participantId": 1, "player": {"puuid": "fixture"}}],
+            "participants": [
+                {"participantId": 1, "teamId": 300, "championId": 22,
+                    "stats": {"win": false, "deaths": 0, "neutralMinionsKilled": 3, "item2": 1001, "item6": 3340}},
+                {"participantId": 2, "teamId": 400}
+            ]
+        });
+        let detail = parse_detail(17, &game, Some(&json!({"puuid": "fixture"}))).unwrap();
+        assert_eq!(detail.teams, [300, 400]);
+        assert_eq!(detail.self_id, Some(1));
+        assert_eq!(detail.score(), None);
+        assert_eq!(detail.duration_seconds, Some(0));
+        let player = &detail.participants[0];
+        assert_eq!(player.kills, None);
+        assert_eq!(player.deaths, Some(0));
+        assert_eq!(player.cs, Some(3));
+        assert_eq!(
+            player.items,
+            [None, None, Some(1001), None, None, None, Some(3340)]
+        );
     }
 }

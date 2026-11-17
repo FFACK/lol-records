@@ -5,7 +5,7 @@ mod elevation;
 mod lcu;
 mod update;
 
-use lcu::{Reply, Request, Snapshot};
+use lcu::{Detail, Reply, Request, Snapshot};
 use native_windows_gui as nwg;
 use std::{
     cell::RefCell,
@@ -20,6 +20,8 @@ struct Cache {
     latest: Option<String>,
     accounts: HashMap<String, Snapshot>,
     details: HashMap<String, String>,
+    #[serde(default)]
+    structured_details: HashMap<String, Detail>,
 }
 
 fn cache_path() -> Option<PathBuf> {
@@ -45,6 +47,29 @@ impl Cache {
 
     fn current(&self) -> Option<&Snapshot> {
         self.accounts.get(self.latest.as_ref()?)
+    }
+
+    fn put_detail(&mut self, account: &str, id: u64, mut detail: Detail) -> bool {
+        if detail.game_id != id {
+            return false;
+        }
+        if let Some((platform, puuid)) = account.split_once(':') {
+            if !platform.is_empty()
+                && detail
+                    .platform
+                    .as_deref()
+                    .is_some_and(|value| value != platform)
+            {
+                return false;
+            }
+            if detail.account_puuid.as_deref() != Some(puuid) {
+                detail.self_id = None;
+            }
+        }
+        detail.account_puuid = None;
+        self.structured_details
+            .insert(format!("{account}:{id}"), detail);
+        true
     }
 
     fn merge(&mut self, mut snapshot: Snapshot) {
@@ -304,7 +329,9 @@ impl App {
             return;
         };
         let key = format!("{}:{}", snapshot.account, game.id);
-        if let Some(details) = cache.details.get(&key) {
+        if let Some(detail) = cache.structured_details.get(&key) {
+            self.detail.set_text(&assets::structured_text(detail));
+        } else if let Some(details) = cache.details.get(&key) {
             self.detail.set_text(&assets::detail_text(details));
         } else {
             self.detail.set_text("");
@@ -324,12 +351,20 @@ impl App {
                 self.detail.set_text("选择一场对局后，点击「查看详情」。");
                 self.render();
             }
-            Reply::Detail(details) => {
-                self.detail.set_text(&assets::detail_text(&details));
-                if let Some(key) = key {
-                    self.cache.borrow_mut().details.insert(key, details);
+            Reply::Detail(detail) => {
+                if let Some(key) = key
+                    && let Some((account, id)) = key.rsplit_once(':')
+                    && let Ok(id) = id.parse()
+                {
+                    let mut cache = self.cache.borrow_mut();
+                    if cache.put_detail(account, id, *detail) {
+                        self.detail
+                            .set_text(&assets::structured_text(&cache.structured_details[&key]));
+                        self.status.set_text("已读取单局详情。");
+                    } else {
+                        self.status.set_text("该局详情与缓存的大区或对局不一致。");
+                    }
                 }
-                self.status.set_text("已读取单局详情。");
             }
             Reply::AccessDenied => {
                 self.status
@@ -645,5 +680,20 @@ fn main() {
     }
     if let Err(error) = gui(args.get(1).is_some_and(|arg| arg == "--update-ready")) {
         nwg::simple_message("国服战绩查询", &format!("窗口初始化失败。{error}"));
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn reads_legacy_details_and_preserves_them_on_save() {
+        let old = r#"{"latest":null,"accounts":{},"details":{"a:1":"旧详情"}}"#;
+        let cache: Cache = serde_json::from_str(old).unwrap();
+        assert!(cache.structured_details.is_empty());
+        assert_eq!(cache.details["a:1"], "旧详情");
+        let reread: Cache = serde_json::from_slice(&serde_json::to_vec(&cache).unwrap()).unwrap();
+        assert_eq!(reread.details["a:1"], "旧详情");
     }
 }

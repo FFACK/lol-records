@@ -28,6 +28,77 @@ pub fn champion_name(id: u64) -> String {
         })
 }
 
+pub fn item_name(id: u64) -> String {
+    REFERENCE
+        .items
+        .get(&id)
+        .cloned()
+        .unwrap_or_else(|| format!("未知装备 #{id}"))
+}
+
+pub fn team_name(id: Option<u64>) -> String {
+    match id {
+        Some(100) => "蓝方".into(),
+        Some(200) => "红方".into(),
+        Some(id) => format!("队伍 {id}"),
+        None => "队伍未知".into(),
+    }
+}
+
+pub fn stat(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "—".into())
+}
+
+pub fn structured_text(detail: &crate::lcu::Detail) -> String {
+    let mut text = detail
+        .duration_seconds
+        .map(|seconds| format!("对局时长 {}:{:02}", seconds / 60, seconds % 60))
+        .unwrap_or_else(|| "对局时长 —".into());
+    if let Some((blue, red)) = detail.score() {
+        text.push_str(&format!("     蓝方 {blue}  /  红方 {red}"));
+    }
+    for team in detail.teams.iter().copied().map(Some).chain([None]) {
+        let mut players = detail
+            .participants
+            .iter()
+            .filter(|player| player.team_id == team)
+            .peekable();
+        if players.peek().is_none() {
+            continue;
+        }
+        text.push_str(&format!(
+            "\r\n\r\n{} · 英雄 / KDA / 补刀 / 装备",
+            team_name(team)
+        ));
+        for player in players {
+            let me = if detail.self_id.is_some() && detail.self_id == player.participant_id {
+                "（我）"
+            } else {
+                ""
+            };
+            let items = player
+                .items
+                .iter()
+                .flatten()
+                .copied()
+                .map(item_name)
+                .collect::<Vec<_>>()
+                .join("、");
+            text.push_str(&format!(
+                "\r\n{}{me}    {} / {} / {}    补刀 {}    {items}",
+                champion_name(player.champion_id.unwrap_or_default()),
+                stat(player.kills),
+                stat(player.deaths),
+                stat(player.assists),
+                stat(player.cs)
+            ));
+        }
+    }
+    text
+}
+
 pub fn mode_name(mode: &str) -> &str {
     match mode {
         "CLASSIC" => "召唤师峡谷",
