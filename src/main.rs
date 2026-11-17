@@ -1,12 +1,19 @@
 #![windows_subsystem = "windows"]
 
+mod assets;
 mod elevation;
 mod lcu;
 mod update;
 
 use lcu::{Reply, Request, Snapshot};
 use native_windows_gui as nwg;
-use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc, sync::mpsc};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    rc::Rc,
+    sync::mpsc,
+};
 
 #[derive(Default, serde::Deserialize, serde::Serialize)]
 struct Cache {
@@ -82,6 +89,13 @@ struct App {
     account_font: nwg::Font,
     section_font: nwg::Font,
     list: nwg::ListView,
+    portraits: nwg::ImageList,
+    portrait_decoder: Option<nwg::ImageDecoder>,
+    portrait_notice: nwg::Notice,
+    portrait_indexes: RefCell<HashMap<u64, i32>>,
+    portrait_pending: RefCell<HashSet<u64>>,
+    portrait_jobs: mpsc::Sender<u64>,
+    portrait_results: mpsc::Receiver<(u64, Option<Vec<u8>>)>,
     detail: nwg::TextBox,
     notice: nwg::Notice,
     cache: RefCell<Cache>,
@@ -158,7 +172,7 @@ impl App {
         self.detail.set_position(24, detail_top as i32 + 42);
         self.detail
             .set_size(content, height.saturating_sub(detail_top + 64).max(1));
-        for (index, share) in [20, 19, 15, 15, 13, 18].into_iter().enumerate() {
+        for (index, share) in [24, 13, 17, 19, 13, 14].into_iter().enumerate() {
             self.list
                 .set_column_width(index, (content.saturating_sub(20) * share / 100) as isize);
         }
@@ -190,19 +204,26 @@ impl App {
                     .as_ref()
                     .map(|s| format!("{}/{}/{}", s.kills, s.deaths, s.assists))
                     .unwrap_or_else(|| "—".into());
+                let image = self.portrait_indexes.borrow().get(&game.champion).copied();
+                if image.is_none()
+                    && game.champion > 0
+                    && self.portrait_pending.borrow_mut().insert(game.champion)
+                {
+                    let _ = self.portrait_jobs.send(game.champion);
+                }
                 self.list.insert_items_row(
                     None,
                     &[
-                        time(game.timestamp),
-                        game.mode.clone(),
-                        game.platform.clone(),
-                        if game.champion > 0 {
-                            game.champion.to_string()
-                        } else {
-                            "—".into()
+                        nwg::InsertListViewItem {
+                            text: Some(assets::champion_name(game.champion)),
+                            image,
+                            ..Default::default()
                         },
-                        result.into(),
-                        kda,
+                        result.to_owned().into(),
+                        kda.into(),
+                        assets::mode_name(&game.mode).to_owned().into(),
+                        game.platform.clone().into(),
+                        time(game.timestamp).into(),
                     ],
                 );
             }
@@ -211,6 +232,47 @@ impl App {
             self.ranks.set_text("");
             self.status
                 .set_text("请先登录游戏大厅，再点击「连接并同步」。");
+        }
+    }
+
+    fn apply_portraits(&self) {
+        let cache = self.cache.borrow();
+        let mut indexes = self.portrait_indexes.borrow_mut();
+        for (id, bytes) in self.portrait_results.try_iter() {
+            self.portrait_pending.borrow_mut().remove(&id);
+            let Some(bytes) = bytes else { continue };
+            let Some(decoder) = &self.portrait_decoder else {
+                continue;
+            };
+            let Ok(bitmap) = decoder
+                .from_stream(&bytes)
+                .and_then(|image| image.frame(0))
+                .and_then(|frame| decoder.resize_image(&frame, [32, 32]))
+                .and_then(|frame| frame.as_bitmap())
+            else {
+                continue;
+            };
+            let image = self.portraits.add_bitmap(&bitmap);
+            if image < 0 {
+                continue;
+            }
+            indexes.insert(id, image);
+            if let Some(snapshot) = cache.current() {
+                for (row, _) in snapshot
+                    .matches
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, game)| game.champion == id)
+                {
+                    self.list.update_item(
+                        row,
+                        nwg::InsertListViewItem {
+                            image: Some(image),
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
         }
     }
 
@@ -243,7 +305,7 @@ impl App {
         };
         let key = format!("{}:{}", snapshot.account, game.id);
         if let Some(details) = cache.details.get(&key) {
-            self.detail.set_text(details);
+            self.detail.set_text(&assets::detail_text(details));
         } else {
             self.detail.set_text("");
             self.request(Request::Detail(game.id), Some(key));
@@ -263,7 +325,7 @@ impl App {
                 self.render();
             }
             Reply::Detail(details) => {
-                self.detail.set_text(&details);
+                self.detail.set_text(&assets::detail_text(&details));
                 if let Some(key) = key {
                     self.cache.borrow_mut().details.insert(key, details);
                 }
@@ -285,11 +347,64 @@ impl App {
     }
 }
 
+fn bind_match_colors(app: &Rc<App>) -> Result<nwg::RawEventHandler, nwg::NwgError> {
+    use windows_sys::Win32::UI::{
+        Controls::{
+            CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDDS_SUBITEM, CDIS_SELECTED, CDRF_DODEFAULT,
+            CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYSUBITEMDRAW, NM_CUSTOMDRAW, NMHDR, NMLVCUSTOMDRAW,
+        },
+        WindowsAndMessaging::WM_NOTIFY,
+    };
+    let list = app.list.handle.hwnd().expect("created match list");
+    let app = Rc::downgrade(app);
+    nwg::bind_raw_event_handler(
+        &app.upgrade().unwrap().window.handle,
+        0x1_0001,
+        move |_, message, _, param| {
+            if message != WM_NOTIFY || param == 0 {
+                return None;
+            }
+            // WM_NOTIFY supplies a valid NMHDR. Only the match list's custom draw uses NMLVCUSTOMDRAW.
+            let header = unsafe { &*(param as *const NMHDR) };
+            if header.hwndFrom != list.cast() || header.code != NM_CUSTOMDRAW {
+                return None;
+            }
+            let draw = unsafe { &mut *(param as *mut NMLVCUSTOMDRAW) };
+            match draw.nmcd.dwDrawStage {
+                CDDS_PREPAINT => Some(CDRF_NOTIFYITEMDRAW as isize),
+                CDDS_ITEMPREPAINT => Some(CDRF_NOTIFYSUBITEMDRAW as isize),
+                stage if stage == CDDS_ITEMPREPAINT | CDDS_SUBITEM => {
+                    if draw.iSubItem == 1
+                        && draw.nmcd.uItemState & CDIS_SELECTED == 0
+                        && let Some(app) = app.upgrade()
+                        && let Ok(cache) = app.cache.try_borrow()
+                        && let Some(stats) = cache
+                            .current()
+                            .and_then(|snapshot| snapshot.matches.get(draw.nmcd.dwItemSpec))
+                            .and_then(|game| game.stats.as_ref())
+                    {
+                        // COLORREF is 0x00BBGGRR.
+                        (draw.clrText, draw.clrTextBk) = if stats.win {
+                            (0x3D6820, 0xECF7E9)
+                        } else {
+                            (0x4131A8, 0xF2EFFD)
+                        };
+                    }
+                    Some(CDRF_DODEFAULT as isize)
+                }
+                _ => None,
+            }
+        },
+    )
+}
+
 fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
     nwg::init()?;
     nwg::Font::set_global_family("Microsoft YaHei UI")?;
     let (tx, rx) = mpsc::channel();
     let (requests, jobs) = mpsc::channel();
+    let (portrait_jobs, portrait_work) = mpsc::channel();
+    let (portrait_tx, portrait_results) = mpsc::channel();
     let (update_tx, update_rx) = mpsc::channel();
     let mut app = App {
         window: Default::default(),
@@ -308,6 +423,13 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
         account_font: Default::default(),
         section_font: Default::default(),
         list: Default::default(),
+        portraits: Default::default(),
+        portrait_decoder: nwg::ImageDecoder::new().ok(),
+        portrait_notice: Default::default(),
+        portrait_indexes: Default::default(),
+        portrait_pending: Default::default(),
+        portrait_jobs,
+        portrait_results,
         detail: Default::default(),
         notice: Default::default(),
         cache: RefCell::new(Cache::load()),
@@ -375,17 +497,15 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
         .text_color([30, 41, 59])
         .ex_flags(nwg::ListViewExFlags::FULL_ROW_SELECT)
         .build(&mut app.list)?;
-    for (label, width) in [
-        ("时间", 132),
-        ("模式", 169),
-        ("大区", 100),
-        ("英雄 ID", 110),
-        ("结果", 90),
-        ("K / D / A", 128),
-    ] {
+    nwg::ImageList::builder()
+        .size((32, 32))
+        .build(&mut app.portraits)?;
+    app.list
+        .set_image_list(Some(&app.portraits), nwg::ListViewImageListType::Small);
+    for label in ["英雄", "结果", "K / D / A", "模式", "大区", "时间"] {
         app.list.insert_column(nwg::InsertListViewColumn {
             text: Some(label.into()),
-            width: Some(width),
+            width: Some(100),
             ..Default::default()
         });
     }
@@ -401,6 +521,9 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
                 | nwg::TextBoxFlags::AUTOVSCROLL,
         )
         .build(&mut app.detail)?;
+    nwg::Notice::builder()
+        .parent(&app.window)
+        .build(&mut app.portrait_notice)?;
     nwg::Notice::builder()
         .parent(&app.window)
         .build(&mut app.notice)?;
@@ -429,9 +552,24 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
             OnButtonClick if handle == app.details_button => app.open_detail(),
             OnListViewItemActivated if handle == app.list => app.open_detail(),
             OnNotice if handle == app.notice => app.finish(),
+            OnNotice if handle == app.portrait_notice => app.apply_portraits(),
             OnNotice if handle == app.update_notice => app.update_event(),
             OnButtonClick if handle == app.update_button => app.update(),
             _ => (),
+        }
+    });
+    let paint = bind_match_colors(&app)?;
+    let portrait_notice = app.portrait_notice.sender();
+    std::thread::spawn(move || {
+        let agent = assets::portrait_client();
+        for id in portrait_work {
+            if portrait_tx
+                .send((id, assets::portrait(&agent, id)))
+                .is_err()
+            {
+                break;
+            }
+            portrait_notice.notice();
         }
     });
     let notice = app.notice.sender();
@@ -484,6 +622,7 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
         }
     });
     nwg::dispatch_thread_events();
+    let _ = nwg::unbind_raw_event_handler(&paint);
     nwg::unbind_event_handler(&handler);
     Ok(())
 }
