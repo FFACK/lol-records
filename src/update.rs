@@ -81,8 +81,9 @@ pub fn check() -> Option<Release> {
     let (repo, _) = config()?;
     let metadata: Metadata = agent()
         .get(format!(
-            "https://gitee.com/api/v5/repos/{repo}/releases/latest"
+            "https://api.github.com/repos/{repo}/releases/latest"
         ))
+        .header("Accept", "application/vnd.github+json")
         .header("User-Agent", "lol-records")
         .call()
         .ok()?
@@ -115,12 +116,12 @@ fn fetch(
 ) -> Result<Vec<u8>, &'static str> {
     let mut response = agent
         .get(format!(
-            "https://gitee.com/{}/releases/download/{}/{asset}",
+            "https://github.com/{}/releases/download/{}/{asset}",
             release.repo, release.tag
         ))
         .header("User-Agent", "lol-records")
         .call()
-        .map_err(|_| "Gitee 下载失败。")?;
+        .map_err(|_| "GitHub 下载失败。")?;
     let mut bytes = Vec::new();
     response
         .body_mut()
