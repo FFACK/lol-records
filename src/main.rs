@@ -371,6 +371,7 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
             _ => (),
         }
     });
+    app.window.set_visible(true);
     if update_ready {
         update::ready();
     } else {
