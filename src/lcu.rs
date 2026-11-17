@@ -36,7 +36,7 @@ pub struct Snapshot {
 }
 #[derive(Deserialize, Serialize)]
 pub enum Reply {
-    Snapshot(Box<Snapshot>, Vec<(u64, String)>),
+    Snapshot(Box<Snapshot>),
     Detail(String),
     AccessDenied,
     Error(String),
@@ -290,16 +290,9 @@ fn stats(value: &Value) -> Option<Stats> {
 }
 pub fn run(request: Request) -> Reply {
     match Session::connect().and_then(|session| match request {
-        Request::Sync => session.sync().map(|snapshot| {
-            let deadline = std::time::Instant::now() + Duration::from_secs(12);
-            let details = snapshot
-                .matches
-                .iter()
-                .take_while(|_| std::time::Instant::now() < deadline)
-                .filter_map(|game| session.detail(game.id).ok().map(|detail| (game.id, detail)))
-                .collect();
-            Reply::Snapshot(Box::new(snapshot), details)
-        }),
+        Request::Sync => session
+            .sync()
+            .map(|snapshot| Reply::Snapshot(Box::new(snapshot))),
         Request::Detail(id) => session.detail(id).map(Reply::Detail),
     }) {
         Ok(reply) | Err(reply) => reply,

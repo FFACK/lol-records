@@ -6,13 +6,16 @@ use std::{
     ffi::OsStr,
     fs::OpenOptions,
     io::{ErrorKind, Read, Write},
-    os::windows::{ffi::OsStrExt, fs::OpenOptionsExt},
+    os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle},
     thread,
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
-    Foundation::CloseHandle,
-    System::Threading::{GetProcessId, WaitForSingleObject},
+    Foundation::{CloseHandle, HANDLE},
+    System::{
+        Pipes::GetNamedPipeServerProcessId,
+        Threading::{GetProcessId, WaitForSingleObject},
+    },
     UI::{
         Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW},
         WindowsAndMessaging::SW_HIDE,
@@ -23,7 +26,18 @@ fn wide(value: &OsStr) -> Vec<u16> {
     value.encode_wide().chain(Some(0)).collect()
 }
 
-pub fn elevated(request: Request) -> Result<Reply, String> {
+pub struct Connection {
+    stream: interprocess::local_socket::Stream,
+    process: HANDLE,
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.process) };
+    }
+}
+
+pub fn connect() -> Result<Connection, String> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(|_| "无法创建本地同步会话。")?;
     let nonce = u128::from_ne_bytes(bytes);
@@ -37,11 +51,10 @@ pub fn elevated(request: Request) -> Result<Reply, String> {
         .nonblocking(ListenerNonblockingMode::Both)
         .create_sync()
         .map_err(|_| "无法监听本地同步通道。")?;
-    let command = match request {
-        Request::Sync => "sync".into(),
-        Request::Detail(id) => id.to_string(),
-    };
-    let args = wide(OsStr::new(&format!("--lcu-worker {pipe} {command}")));
+    let args = wide(OsStr::new(&format!(
+        "--lcu-worker {pipe} {}",
+        std::process::id()
+    )));
     let executable = std::env::current_exe().map_err(|_| "无法定位当前程序。")?;
     let executable = wide(executable.as_os_str());
     let verb = wide(OsStr::new("runas"));
@@ -63,7 +76,7 @@ pub fn elevated(request: Request) -> Result<Reply, String> {
     }
     let result = (|| {
         let deadline = Instant::now() + Duration::from_secs(45);
-        let mut stream = loop {
+        let stream = loop {
             match listener.accept() {
                 Ok(stream) => break stream,
                 Err(error) if error.kind() == ErrorKind::WouldBlock => (),
@@ -84,11 +97,33 @@ pub fn elevated(request: Request) -> Result<Reply, String> {
         {
             return Err("本地同步进程身份不匹配。");
         }
+        Ok(Connection {
+            stream,
+            process: info.hProcess,
+        })
+    })();
+    if result.is_err() {
+        unsafe { CloseHandle(info.hProcess) };
+    }
+    result.map_err(str::to_owned)
+}
+
+impl Connection {
+    pub fn query(&mut self, request: Request) -> Result<Reply, &'static str> {
+        let mut command = [0; 9];
+        if let Request::Detail(id) = request {
+            command[0] = 1;
+            command[1..].copy_from_slice(&id.to_le_bytes());
+        }
+        self.stream
+            .write_all(&command)
+            .map_err(|_| "同步连接已断开。请点击「连接并同步」重新连接。")?;
+        let deadline = Instant::now() + Duration::from_secs(45);
         let mut data = Vec::new();
         let mut buffer = [0u8; 8192];
         loop {
-            let worker_exited = unsafe { WaitForSingleObject(info.hProcess, 0) } == 0;
-            match stream.read(&mut buffer) {
+            let worker_exited = unsafe { WaitForSingleObject(self.process, 0) } == 0;
+            match self.stream.read(&mut buffer) {
                 // Windows may report an empty read while the worker is still querying LCU.
                 Ok(0) => {
                     if worker_exited {
@@ -121,36 +156,46 @@ pub fn elevated(request: Request) -> Result<Reply, String> {
             }
         }
         serde_json::from_slice(&data).map_err(|_| "管理员同步结果无效。")
-    })();
-    unsafe { CloseHandle(info.hProcess) };
-    result.map_err(str::to_owned)
+    }
 }
 
-pub fn worker(pipe: &str, command: &str) {
+pub fn worker(pipe: &str, parent_pid: u32) {
     let Some(nonce) = pipe.strip_prefix("lol-records-") else {
         return;
     };
     if nonce.len() != 32 || !nonce.bytes().all(|b| b.is_ascii_hexdigit()) {
         return;
     }
-    let request = if command == "sync" {
-        Request::Sync
-    } else {
-        match command.parse() {
-            Ok(id) => Request::Detail(id),
-            Err(_) => return,
-        }
-    };
-    // Identification-level SQOS prevents a pipe server from impersonating this process.
+
+    // The elevated process must not grant its impersonation token to the pipe server.
     let Ok(mut stream) = OpenOptions::new()
+        .read(true)
         .write(true)
         .security_qos_flags(0x0001_0000)
         .open(format!(r"\\.\pipe\{pipe}"))
     else {
         return;
     };
-    if let Ok(mut data) = serde_json::to_vec(&lcu::run(request)) {
+    let mut server_pid = 0;
+    if unsafe { GetNamedPipeServerProcessId(stream.as_raw_handle(), &mut server_pid) } == 0
+        || server_pid != parent_pid
+    {
+        return;
+    }
+
+    let mut command = [0; 9];
+    while stream.read_exact(&mut command).is_ok() {
+        let request = match command[0] {
+            0 => Request::Sync,
+            1 => Request::Detail(u64::from_le_bytes(command[1..].try_into().unwrap())),
+            _ => break,
+        };
+        let Ok(mut data) = serde_json::to_vec(&lcu::run(request)) else {
+            break;
+        };
         data.push(b'\n');
-        let _ = stream.write_all(&data);
+        if stream.write_all(&data).is_err() {
+            break;
+        }
     }
 }

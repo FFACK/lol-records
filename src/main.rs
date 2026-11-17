@@ -80,7 +80,7 @@ struct App {
     detail: nwg::TextBox,
     notice: nwg::Notice,
     cache: RefCell<Cache>,
-    tx: mpsc::Sender<(Option<String>, Reply)>,
+    requests: mpsc::Sender<(Request, Option<String>)>,
     rx: mpsc::Receiver<(Option<String>, Reply)>,
 }
 
@@ -187,15 +187,11 @@ impl App {
         self.sync.set_enabled(false);
         self.details_button.set_enabled(false);
         self.status.set_text("正在读取英雄联盟客户端…");
-        let (tx, notify) = (self.tx.clone(), self.notice.sender());
-        std::thread::spawn(move || {
-            let reply = match lcu::run(request) {
-                Reply::AccessDenied => elevation::elevated(request).unwrap_or_else(Reply::Error),
-                reply => reply,
-            };
-            let _ = tx.send((key, reply));
-            notify.notice();
-        });
+        if self.requests.send((request, key)).is_err() {
+            self.sync.set_enabled(true);
+            self.details_button.set_enabled(true);
+            self.status.set_text("查询线程已退出，请重新打开工具。");
+        }
     }
 
     fn open_detail(&self) {
@@ -230,15 +226,8 @@ impl App {
         self.sync.set_enabled(true);
         self.details_button.set_enabled(true);
         match reply {
-            Reply::Snapshot(snapshot, details) => {
-                let mut cache = self.cache.borrow_mut();
-                for (id, detail) in details {
-                    cache
-                        .details
-                        .insert(format!("{}:{id}", snapshot.account), detail);
-                }
-                cache.merge(*snapshot);
-                drop(cache);
+            Reply::Snapshot(snapshot) => {
+                self.cache.borrow_mut().merge(*snapshot);
                 self.detail.set_text("");
                 self.render();
             }
@@ -269,6 +258,7 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
     nwg::init()?;
     nwg::Font::set_global_family("Microsoft YaHei UI")?;
     let (tx, rx) = mpsc::channel();
+    let (requests, jobs) = mpsc::channel();
     let (update_tx, update_rx) = mpsc::channel();
     let mut app = App {
         window: Default::default(),
@@ -285,7 +275,7 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
         detail: Default::default(),
         notice: Default::default(),
         cache: RefCell::new(Cache::load()),
-        tx,
+        requests,
         rx,
     };
     nwg::Window::builder()
@@ -378,6 +368,42 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
             _ => (),
         }
     });
+    let notice = app.notice.sender();
+    std::thread::spawn(move || {
+        let mut connection: Option<elevation::Connection> = None;
+        for (request, key) in jobs {
+            let reply = if let Some(session) = &mut connection {
+                match session.query(request) {
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        connection = None;
+                        Reply::Error(error.into())
+                    }
+                }
+            } else {
+                match lcu::run(request) {
+                    Reply::AccessDenied if matches!(request, Request::Sync) => {
+                        match elevation::connect() {
+                            Ok(mut session) => match session.query(request) {
+                                Ok(reply) => {
+                                    connection = Some(session);
+                                    reply
+                                }
+                                Err(error) => Reply::Error(error.into()),
+                            },
+                            Err(error) => Reply::Error(error),
+                        }
+                    }
+                    Reply::AccessDenied => Reply::Error("请先点击「连接并同步」授权。".into()),
+                    reply => reply,
+                }
+            };
+            if tx.send((key, reply)).is_err() {
+                break;
+            }
+            notice.notice();
+        }
+    });
     app.window.set_visible(true);
     if update_ready {
         update::ready();
@@ -406,7 +432,9 @@ fn main() {
             return;
         }
         if mode == "--lcu-worker" {
-            elevation::worker(pipe, command);
+            if let Ok(parent_pid) = command.parse() {
+                elevation::worker(pipe, parent_pid);
+            }
             return;
         }
     }
