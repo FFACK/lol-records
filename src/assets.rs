@@ -36,10 +36,10 @@ pub fn item_name(id: u64) -> String {
         .unwrap_or_else(|| format!("未知装备 #{id}"))
 }
 
-pub fn team_name(id: Option<u64>) -> String {
+pub fn team_name(id: Option<u64>, standard: bool) -> String {
     match id {
-        Some(100) => "蓝方".into(),
-        Some(200) => "红方".into(),
+        Some(100) if standard => "蓝方".into(),
+        Some(200) if standard => "红方".into(),
         Some(id) => format!("队伍 {id}"),
         None => "队伍未知".into(),
     }
@@ -70,7 +70,7 @@ pub fn structured_text(detail: &crate::lcu::Detail) -> String {
         }
         text.push_str(&format!(
             "\r\n\r\n{} · 英雄 / KDA / 补刀 / 装备",
-            team_name(team)
+            team_name(team, detail.teams == [100, 200])
         ));
         for player in players {
             let me = if detail.self_id.is_some() && detail.self_id == player.participant_id {
@@ -180,13 +180,31 @@ pub fn portrait_client() -> ureq::Agent {
         .new_agent()
 }
 
-pub fn portrait(agent: &ureq::Agent, id: u64) -> Option<Vec<u8>> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ImageKey {
+    Champion(u64),
+    Item(u64),
+}
+
+pub fn image(agent: &ureq::Agent, key: ImageKey) -> Option<Vec<u8>> {
     const MAX_BYTES: usize = 256 * 1024;
-    let (_, filename) = REFERENCE.champions.get(&id)?;
+    let (folder, group, id, filename) = match key {
+        ImageKey::Champion(id) => (
+            "portraits",
+            "champion",
+            id,
+            REFERENCE.champions.get(&id)?.1.clone(),
+        ),
+        ImageKey::Item(id) => {
+            REFERENCE.items.get(&id)?;
+            ("items", "item", id, format!("{id}.png"))
+        }
+    };
     let path = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .map(|root| {
-            root.join("LolRecords/portraits")
+            root.join("LolRecords")
+                .join(folder)
                 .join(&REFERENCE.version)
                 .join(format!("{id}.png"))
         });
@@ -206,7 +224,7 @@ pub fn portrait(agent: &ureq::Agent, id: u64) -> Option<Vec<u8>> {
     }
     let mut response = agent
         .get(format!(
-            "https://ddragon.leagueoflegends.com/cdn/{}/img/champion/{filename}",
+            "https://ddragon.leagueoflegends.com/cdn/{}/img/{group}/{filename}",
             REFERENCE.version
         ))
         .call()
