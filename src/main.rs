@@ -311,6 +311,11 @@ fn physical(value: i32, dpi: u32) -> i32 {
     (value as f32 * dpi as f32 / 96.0).round() as i32
 }
 
+fn content_bounds(window_width: i32) -> (i32, i32) {
+    let width = window_width.min(1280);
+    ((window_width - width) / 2, width)
+}
+
 fn pane_size(handle: nwg::ControlHandle) -> (f32, f32) {
     let (width, height, dpi) = client(hwnd(handle));
     (dip(width as i32, dpi), dip(height as i32, dpi))
@@ -353,14 +358,14 @@ impl App {
         if width == 0 || height == 0 {
             return;
         }
-        let width = dip(width as i32, dpi) as i32;
+        let (offset, width) = content_bounds(dip(width as i32, dpi) as i32);
         let height = dip(height as i32, dpi) as i32;
         let panel_height = (height - 244).max(1);
         let detail_width = (width - 383).max(1);
         let place = |control, x: i32, y: i32, w: i32, h: i32| unsafe {
             MoveWindow(
                 hwnd(control),
-                physical(x, dpi),
+                physical(x + offset, dpi),
                 physical(y, dpi),
                 physical(w.max(1), dpi),
                 physical(h.max(1), dpi),
@@ -373,7 +378,7 @@ impl App {
         place(self.account.handle, 44, 26, width - 370, 34);
         place(self.ranks.handle, 45, 66, width - 240, 24);
         place(self.status.handle, 45, 96, width - 240, 24);
-        place(self.search.handle, 24, 148, width - 344, 34);
+        place(self.search.handle, 36, 154, width - 368, 24);
         place(self.search_button.handle, width - 308, 148, 112, 34);
         place(self.live_button.handle, width - 184, 148, 160, 34);
         place(self.matches_heading.handle, 24, 198, 160, 22);
@@ -1314,16 +1319,26 @@ fn bind_panes(app: &Rc<App>) -> Result<Vec<nwg::RawEventHandler>, nwg::NwgError>
                         GetClientRect(window.cast(), &mut rect);
                         FillRect(key as HWND, &rect, app.header_brush);
                         let dpi = client(window.cast()).2;
+                        let (offset, width) = content_bounds(dip(rect.right, dpi) as i32);
                         let brush = SelectObject(key as _, app.card_brush);
                         let pen = SelectObject(key as _, GetStockObject(NULL_PEN));
                         RoundRect(
                             key as _,
-                            physical(24, dpi),
+                            physical(offset + 24, dpi),
                             physical(16, dpi),
-                            rect.right - physical(24, dpi),
+                            physical(offset + width - 24, dpi),
                             physical(136, dpi),
                             physical(20, dpi),
                             physical(20, dpi),
+                        );
+                        RoundRect(
+                            key as _,
+                            physical(offset + 24, dpi),
+                            physical(148, dpi),
+                            physical(offset + width - 320, dpi),
+                            physical(184, dpi),
+                            physical(12, dpi),
+                            physical(12, dpi),
                         );
                         SelectObject(key as _, pen);
                         SelectObject(key as _, brush);
@@ -1905,6 +1920,23 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
     nwg::TextInput::builder()
         .parent(&app.window)
         .build(&mut app.search)?;
+    unsafe {
+        let input = hwnd(app.search.handle);
+        SetWindowLongPtrW(
+            input,
+            GWL_STYLE,
+            GetWindowLongPtrW(input, GWL_STYLE) & !(WS_BORDER as isize),
+        );
+        SetWindowPos(
+            input,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+    }
     let cue: Vec<u16> = "搜索当前大区玩家：昵称#编号"
         .encode_utf16()
         .chain(Some(0))
@@ -1928,24 +1960,29 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
         .build(&mut app.update_button)?;
     app.update_button.set_visible(false);
     nwg::Label::builder()
+        .background_color(Some([24, 31, 48]))
         .position((24, 12))
         .parent(&app.window)
         .build(&mut app.account)?;
     nwg::Label::builder()
+        .background_color(Some([24, 31, 48]))
         .position((25, 50))
         .parent(&app.window)
         .build(&mut app.ranks)?;
     nwg::Label::builder()
+        .background_color(Some([24, 31, 48]))
         .position((25, 74))
         .parent(&app.window)
         .build(&mut app.status)?;
     nwg::Label::builder()
+        .background_color(Some([17, 22, 36]))
         .text("近期战绩")
         .position((24, 98))
         .size((160, 22))
         .parent(&app.window)
         .build(&mut app.matches_heading)?;
     nwg::Label::builder()
+        .background_color(Some([17, 22, 36]))
         .text("对局详情")
         .size((160, 22))
         .parent(&app.window)
@@ -1982,6 +2019,7 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
         nwg::Notice::builder().parent(&app.window).build(notice)?;
     }
     nwg::Label::builder()
+        .background_color(Some([17, 22, 36]))
         .text("检查图片缓存…")
         .size((306, 22))
         .parent(&app.window)
@@ -2167,6 +2205,17 @@ mod interaction_tests {
         MatchKey {
             account: "HN1:fixture".into(),
             id,
+        }
+    }
+
+    #[test]
+    fn ultrawide_windows_keep_a_centered_bounded_content_area() {
+        for window_width in [780, 1080, 1280, 1920, 2505, 3440] {
+            let (left, width) = content_bounds(window_width);
+            assert!(width <= 1280);
+            assert_eq!(left, (window_width - width) / 2);
+            assert!(left >= 0 && left + width <= window_width);
+            assert!((width - 383) <= 897);
         }
     }
 

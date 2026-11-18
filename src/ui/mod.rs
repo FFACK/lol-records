@@ -60,6 +60,27 @@ pub struct Slot {
     pub slot: usize,
 }
 
+fn wide_row(width: f32) -> bool {
+    width >= 840.0
+}
+fn name_width(width: f32) -> f32 {
+    if wide_row(width) {
+        164.0
+    } else {
+        width - 242.0
+    }
+}
+fn stats_x(width: f32) -> f32 {
+    if wide_row(width) {
+        width - 240.0
+    } else {
+        width - 166.0
+    }
+}
+fn player_height(width: f32) -> f32 {
+    if wide_row(width) { 82.0 } else { 106.0 }
+}
+
 impl DetailLayout {
     pub fn new(width: f32, body: &Body<'_>) -> Self {
         let mut layout = Self {
@@ -96,11 +117,10 @@ impl DetailLayout {
                     layout.push(34.0, RowKind::Team(team));
                     for (index, player) in players {
                         let row_top = layout.height;
-                        let numbers = width - 166.0;
                         layout
                             .players
-                            .push((rect(70.0, row_top + 4.0, numbers - 76.0, 37.0), index));
-                        layout.push(114.0, RowKind::Player(index));
+                            .push((rect(70.0, row_top + 4.0, name_width(width), 37.0), index));
+                        layout.push(player_height(width), RowKind::Player(index));
                         for (slot, id) in player.items.iter().enumerate() {
                             if let Some(id) = id {
                                 layout.items.push(Slot {
@@ -151,8 +171,11 @@ impl DetailLayout {
 }
 
 fn item_rect(width: f32, y: f32, index: usize) -> D2D_RECT_F {
-    let _ = width;
-    let (left, top) = (70.0, y + 80.0);
+    let (left, top) = if wide_row(width) {
+        (350.0, y + 22.0)
+    } else {
+        (70.0, y + 72.0)
+    };
     rect(
         left + index as f32 * 31.0 + if index == 6 { 7.0 } else { 0.0 },
         top,
@@ -213,7 +236,11 @@ fn combat_slots(
     {
         slots.push((
             ImageKey::Rank(rank.tier),
-            rect(23.0, y + 79.0, 28.0, 28.0),
+            if wide_row(width) {
+                rect(242.0, y + 12.0, 28.0, 28.0)
+            } else {
+                rect(23.0, y + 68.0, 28.0, 28.0)
+            },
             format!("{} · 查询 {}", rank.label, time(rank.checked_at)),
         ));
     }
@@ -222,7 +249,11 @@ fn combat_slots(
             let key = ImageKey::Spell(*id);
             slots.push((
                 key,
-                rect(width - 136.0 + index as f32 * 27.0, y + 46.0, 23.0, 23.0),
+                if wide_row(width) {
+                    rect(282.0, y + 12.0 + index as f32 * 28.0, 23.0, 23.0)
+                } else {
+                    rect(width - 136.0 + index as f32 * 27.0, y + 46.0, 23.0, 23.0)
+                },
                 assets::image_name(key),
             ));
         }
@@ -232,7 +263,11 @@ fn combat_slots(
             let key = ImageKey::Rune(*id);
             slots.push((
                 key,
-                rect(width - 78.0 + index as f32 * 27.0, y + 46.0, 23.0, 23.0),
+                if wide_row(width) {
+                    rect(310.0, y + 12.0 + index as f32 * 28.0, 23.0, 23.0)
+                } else {
+                    rect(width - 78.0 + index as f32 * 27.0, y + 46.0, 23.0, 23.0)
+                },
                 assets::image_name(key),
             ));
         }
@@ -530,7 +565,11 @@ pub fn paint_detail(
                     needed,
                 );
                 if state.player_hover == Some(*index) {
-                    surface.fill(rect(65.0, y + 2.0, width - 242.0, 41.0), CARD, 5.0);
+                    surface.fill(
+                        rect(65.0, y + 2.0, name_width(width) + 5.0, 41.0),
+                        CARD,
+                        5.0,
+                    );
                 }
                 let name = format!(
                     "{}{}",
@@ -540,11 +579,11 @@ pub fn paint_detail(
                         .unwrap_or("召唤师信息待刷新"),
                     if me { "  我" } else { "" }
                 );
-                let numbers = width - 166.0;
+                let numbers = stats_x(width);
                 surface.text(
                     renderer,
                     &name,
-                    rect(70.0, y + 2.0, numbers - 76.0, 23.0),
+                    rect(70.0, y + 2.0, name_width(width), 23.0),
                     Font::Base,
                     if player.puuid.as_deref().is_some_and(crate::lcu::valid_puuid) {
                         ACCENT
@@ -561,7 +600,7 @@ pub fn paint_detail(
                 surface.text(
                     renderer,
                     &identity,
-                    rect(70.0, y + 24.0, numbers - 76.0, 17.0),
+                    rect(70.0, y + 24.0, name_width(width), 17.0),
                     Font::Small,
                     MUTED,
                 );
@@ -581,7 +620,12 @@ pub fn paint_detail(
                 surface.text(
                     renderer,
                     &format!("补刀 {}", assets::stat(player.cs)),
-                    rect(numbers + 88.0, y + 5.0, 65.0, 34.0),
+                    rect(
+                        numbers + 100.0,
+                        y + 5.0,
+                        120.0_f32.min(width - numbers - 112.0),
+                        34.0,
+                    ),
                     Font::Small,
                     MUTED,
                 );
@@ -589,7 +633,12 @@ pub fn paint_detail(
                 surface.text(
                     renderer,
                     &economy,
-                    rect(numbers, y + 29.0, 153.0, 20.0),
+                    rect(
+                        numbers,
+                        y + if wide_row(width) { 42.0 } else { 26.0 },
+                        width - numbers - 18.0,
+                        18.0,
+                    ),
                     Font::Small,
                     MUTED,
                 );
@@ -606,7 +655,11 @@ pub fn paint_detail(
                 surface.text(
                     renderer,
                     rank_label,
-                    rect(23.0, y + 43.0, (width - 186.0).max(90.0), 17.0),
+                    if wide_row(width) {
+                        rect(70.0, y + 57.0, 200.0, 17.0)
+                    } else {
+                        rect(70.0, y + 48.0, (width - 256.0).max(90.0), 17.0)
+                    },
                     Font::Small,
                     MUTED,
                 );
@@ -661,6 +714,40 @@ pub fn paint_detail(
                 Font::Small,
                 TEXT,
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    #[test]
+    fn player_icons_stay_disjoint_in_compact_and_wide_rows() {
+        let detail:Detail=serde_json::from_value(serde_json::json!({"game_id":1,"teams":[100],"participants":[{"participant_id":1,"team_id":100,"items":[1001,1002,1003,1004,1005,1006,3340],"spells":[4,14],"runes":[8005,8100],"rank":{"tier":6,"label":"当前单双排 翡翠 II 37LP","checked_at":1}}]})).unwrap();
+        for width in [380.0, 397.0, 640.0, 839.0, 840.0, 897.0] {
+            let layout = DetailLayout::new(width, &Body::Structured(&detail));
+            assert_eq!(layout.items.len(), 12);
+            for (index, slot) in layout.items.iter().enumerate() {
+                assert!(
+                    slot.rect.left >= 12.0 && slot.rect.right <= width - 12.0,
+                    "clipped icon at width {width}"
+                );
+                assert!(
+                    slot.rect.top >= DETAIL_HEADER + 34.0
+                        && slot.rect.bottom <= DETAIL_HEADER + 34.0 + player_height(width),
+                    "row overflow at width {width}"
+                );
+                for other in &layout.items[index + 1..] {
+                    let overlap = slot.rect.left < other.rect.right
+                        && slot.rect.right > other.rect.left
+                        && slot.rect.top < other.rect.bottom
+                        && slot.rect.bottom > other.rect.top;
+                    assert!(!overlap, "overlapping icons at width {width}");
+                }
+            }
+            if wide_row(width) {
+                assert!(item_rect(width, 0.0, 6).right < stats_x(width));
+            }
         }
     }
 }
