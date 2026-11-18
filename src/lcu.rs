@@ -36,6 +36,12 @@ pub struct Snapshot {
 }
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Participant {
+    #[serde(default)]
+    pub summoner_name: Option<String>,
+    #[serde(default)]
+    pub tag_line: Option<String>,
+    #[serde(default)]
+    pub puuid: Option<String>,
     pub participant_id: Option<u64>,
     pub team_id: Option<u64>,
     pub champion_id: Option<u64>,
@@ -92,6 +98,7 @@ pub enum Reply {
 pub enum Request {
     Sync,
     Detail(u64),
+    Profile([u8; 36]),
 }
 
 struct Session {
@@ -178,6 +185,20 @@ exit 4
 
     fn sync(&self) -> Result<Snapshot, Reply> {
         let account = self.get("/lol-summoner/v1/current-summoner")?;
+        self.profile_snapshot(account)
+    }
+
+    fn profile(&self, puuid: [u8; 36]) -> Result<Snapshot, Reply> {
+        let puuid =
+            std::str::from_utf8(&puuid).map_err(|_| Reply::Error("玩家标识无效。".into()))?;
+        if !valid_puuid(puuid) {
+            return Err(Reply::Error("玩家标识无效。".into()));
+        }
+        let account = self.get(&format!("/lol-summoner/v2/summoners/puuid/{puuid}"))?;
+        self.profile_snapshot(account)
+    }
+
+    fn profile_snapshot(&self, account: Value) -> Result<Snapshot, Reply> {
         let puuid = account["puuid"]
             .as_str()
             .filter(|s| {
@@ -187,9 +208,9 @@ exit 4
             })
             .ok_or_else(|| Reply::Error("客户端尚未返回有效账号。".into()))?;
         let rank = self.get(&format!("/lol-ranked/v1/ranked-stats/{puuid}"))?;
-        let history = self.get(
-            "/lol-match-history/v1/products/lol/current-summoner/matches?begIndex=0&endIndex=19",
-        )?;
+        let history = self.get(&format!(
+            "/lol-match-history/v1/products/lol/{puuid}/matches?begIndex=0&endIndex=19"
+        ))?;
         let games = history["games"]["games"]
             .as_array()
             .ok_or_else(|| Reply::Error("战绩返回格式与当前版本不兼容。".into()))?;
@@ -316,7 +337,26 @@ fn parse_detail(id: u64, game: &Value, account: Option<&Value>) -> Option<Detail
             let stats = &p["stats"];
             let lane = stats["totalMinionsKilled"].as_u64();
             let jungle = stats["neutralMinionsKilled"].as_u64();
+            let identity = game["participantIdentities"].as_array().and_then(|rows| {
+                rows.iter()
+                    .find(|row| row["participantId"] == p["participantId"])
+            });
+            let player = identity.map(|identity| &identity["player"]);
+            let nonempty = |value: Option<&Value>| {
+                value
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            };
             Participant {
+                summoner_name: nonempty(
+                    player.and_then(|p| p.get("gameName").or_else(|| p.get("riotIdGameName"))),
+                )
+                .or_else(|| nonempty(player.and_then(|p| p.get("summonerName")))),
+                tag_line: nonempty(
+                    player.and_then(|p| p.get("tagLine").or_else(|| p.get("riotIdTagline"))),
+                ),
+                puuid: nonempty(player.and_then(|p| p.get("puuid"))),
                 participant_id: p["participantId"].as_u64(),
                 team_id: p["teamId"].as_u64().filter(|id| *id != 0),
                 champion_id: p["championId"].as_u64().filter(|id| *id != 0),
@@ -367,6 +407,16 @@ fn parse_detail(id: u64, game: &Value, account: Option<&Value>) -> Option<Detail
     })
 }
 
+pub fn valid_puuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(i, b)| {
+            if [8, 13, 18, 23].contains(&i) {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        })
+}
 fn string(value: &Value) -> &str {
     value.as_str().unwrap_or_default()
 }
@@ -390,6 +440,9 @@ pub fn run(request: Request) -> Reply {
     match Session::connect().and_then(|session| match request {
         Request::Sync => session
             .sync()
+            .map(|snapshot| Reply::Snapshot(Box::new(snapshot))),
+        Request::Profile(puuid) => session
+            .profile(puuid)
             .map(|snapshot| Reply::Snapshot(Box::new(snapshot))),
         Request::Detail(id) => session
             .detail(id)
@@ -424,7 +477,7 @@ mod tests {
     fn preserves_other_teams_and_optional_stats_and_item_slots() {
         let game = json!({
             "gameDuration": 0,
-            "participantIdentities": [{"participantId": 1, "player": {"puuid": "fixture"}}],
+            "participantIdentities": [{"participantId": 1, "player": {"puuid": "fixture", "gameName": "测试召唤师", "tagLine": "12345"}}],
             "participants": [
                 {"participantId": 1, "teamId": 300, "championId": 22,
                     "stats": {"win": false, "deaths": 0, "neutralMinionsKilled": 3, "item2": 1001, "item6": 3340}},
@@ -437,6 +490,9 @@ mod tests {
         assert_eq!(detail.score(), None);
         assert_eq!(detail.duration_seconds, Some(0));
         let player = &detail.participants[0];
+        assert_eq!(player.summoner_name.as_deref(), Some("测试召唤师"));
+        assert_eq!(player.tag_line.as_deref(), Some("12345"));
+        assert_eq!(player.puuid.as_deref(), Some("fixture"));
         assert_eq!(player.kills, None);
         assert_eq!(player.deaths, Some(0));
         assert_eq!(player.cs, Some(3));

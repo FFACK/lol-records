@@ -110,10 +110,14 @@ pub fn connect() -> Result<Connection, String> {
 
 impl Connection {
     pub fn query(&mut self, request: Request) -> Result<Reply, &'static str> {
-        let mut command = [0; 9];
+        let mut command = [0; 37];
         if let Request::Detail(id) = request {
             command[0] = 1;
-            command[1..].copy_from_slice(&id.to_le_bytes());
+            command[1..9].copy_from_slice(&id.to_le_bytes());
+        }
+        if let Request::Profile(puuid) = request {
+            command[0] = 2;
+            command[1..37].copy_from_slice(&puuid);
         }
         self.stream
             .write_all(&command)
@@ -183,11 +187,18 @@ pub fn worker(pipe: &str, parent_pid: u32) {
         return;
     }
 
-    let mut command = [0; 9];
+    let mut command = [0; 37];
     while stream.read_exact(&mut command).is_ok() {
         let request = match command[0] {
             0 => Request::Sync,
-            1 => Request::Detail(u64::from_le_bytes(command[1..].try_into().unwrap())),
+            1 => Request::Detail(u64::from_le_bytes(command[1..9].try_into().unwrap())),
+            2 => {
+                let bytes: [u8; 36] = command[1..37].try_into().unwrap();
+                if !std::str::from_utf8(&bytes).is_ok_and(lcu::valid_puuid) {
+                    break;
+                }
+                Request::Profile(bytes)
+            }
             _ => break,
         };
         let Ok(mut data) = serde_json::to_vec(&lcu::run(request)) else {

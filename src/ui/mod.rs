@@ -37,6 +37,7 @@ pub struct DetailLayout {
     rows: Vec<Row>,
     pub height: f32,
     pub items: Vec<Slot>,
+    pub players: Vec<(D2D_RECT_F, usize)>,
 }
 
 struct Row {
@@ -63,6 +64,7 @@ impl DetailLayout {
             rows: Vec::new(),
             height: DETAIL_HEADER,
             items: Vec::new(),
+            players: Vec::new(),
         };
         match body {
             Body::Empty(_) => layout.height += 66.0,
@@ -93,6 +95,10 @@ impl DetailLayout {
                     layout.push(34.0, RowKind::Team(team));
                     for (index, player) in players {
                         let row_top = layout.height;
+                        let numbers = if wide { width - 394.0 } else { width - 163.0 };
+                        layout
+                            .players
+                            .push((rect(70.0, row_top + 4.0, numbers - 76.0, 37.0), index));
                         layout.push(if wide { 51.0 } else { 78.0 }, RowKind::Player(index));
                         for (slot, id) in player.items.iter().enumerate() {
                             if let Some(id) = id {
@@ -419,7 +425,10 @@ pub fn paint_detail(
                 );
                 let name = format!(
                     "{}{}",
-                    assets::champion_name(player.champion_id.unwrap_or_default()),
+                    player
+                        .summoner_name
+                        .as_deref()
+                        .unwrap_or("召唤师信息待刷新"),
                     if me { "  我" } else { "" }
                 );
                 let wide = width >= 600.0;
@@ -427,9 +436,22 @@ pub fn paint_detail(
                 surface.text(
                     renderer,
                     &name,
-                    rect(70.0, y + 5.0, numbers - 76.0, 34.0),
+                    rect(70.0, y + 2.0, numbers - 76.0, 23.0),
                     Font::Base,
-                    TEXT,
+                    ACCENT,
+                );
+                let identity = player
+                    .tag_line
+                    .as_ref()
+                    .map(|tag| format!("#{tag}"))
+                    .or_else(|| player.puuid.clone())
+                    .unwrap_or_else(|| "标识待刷新".into());
+                surface.text(
+                    renderer,
+                    &identity,
+                    rect(70.0, y + 24.0, numbers - 76.0, 17.0),
+                    Font::Small,
+                    MUTED,
                 );
                 let kda = format!(
                     "{} / {} / {}",

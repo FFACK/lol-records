@@ -84,7 +84,11 @@ impl Cache {
                 return false;
             }
             if detail.account_puuid.as_deref() != Some(puuid) {
-                detail.self_id = None;
+                detail.self_id = detail
+                    .participants
+                    .iter()
+                    .find(|p| p.puuid.as_deref() == Some(puuid))
+                    .and_then(|p| p.participant_id);
             }
         }
         detail.account_puuid = None;
@@ -553,7 +557,15 @@ impl App {
             id: game.id,
         };
         let cache_key = key.cache_key();
-        let query = !cache.structured_details.contains_key(&cache_key)
+        let query = !cache
+            .structured_details
+            .get(&cache_key)
+            .is_some_and(|detail| {
+                detail
+                    .participants
+                    .iter()
+                    .any(|p| p.summoner_name.is_some())
+            })
             && (!cache.details.contains_key(&cache_key) || self.sync.text() == "刷新战绩");
         self.selection.borrow_mut().select(Some(key), query);
         drop(cache);
@@ -574,7 +586,13 @@ impl App {
             .cache
             .borrow()
             .structured_details
-            .contains_key(&ticket.key.cache_key())
+            .get(&ticket.key.cache_key())
+            .is_some_and(|detail| {
+                detail
+                    .participants
+                    .iter()
+                    .any(|p| p.summoner_name.is_some())
+            })
         {
             selection.complete(&ticket);
         } else if self
@@ -584,6 +602,46 @@ impl App {
         {
             selection.complete(&ticket);
             selection.error = Some("查询线程已退出，请重新打开工具。".into());
+        }
+    }
+
+    fn profile_at(&self, x: f32, y: f32) {
+        if self.sync_busy.get() || self.update_busy.get() {
+            return;
+        }
+        let index = self
+            .detail_layout
+            .borrow()
+            .players
+            .iter()
+            .find(|(r, _)| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
+            .map(|(_, index)| *index);
+        let puuid = {
+            let cache = self.cache.borrow();
+            let selection = self.selection.borrow();
+            let (_, body) = Self::selected(&cache, &selection);
+            match (index, body) {
+                (Some(index), Body::Structured(detail)) => {
+                    detail.participants.get(index).and_then(|p| p.puuid.clone())
+                }
+                _ => None,
+            }
+        };
+        let Some(puuid) = puuid.filter(|id| lcu::valid_puuid(id)) else {
+            self.status
+                .set_text("该玩家标识未缓存，请连接后重新读取这场详情。");
+            return;
+        };
+        self.sync_busy.set(true);
+        self.sync.set_enabled(false);
+        self.status.set_text("正在读取该召唤师的战绩…");
+        if self
+            .requests
+            .send((Request::Profile(puuid.as_bytes().try_into().unwrap()), None))
+            .is_err()
+        {
+            self.sync_busy.set(false);
+            self.sync.set_enabled(true);
         }
     }
 
@@ -647,6 +705,7 @@ impl App {
                         self.cache.borrow_mut().merge(*snapshot);
                         self.sync.set_text("刷新战绩");
                         self.load_snapshot(same);
+                        self.open_detail();
                         saved = true;
                     }
                     Reply::Error(error) => self.status.set_text(&format!("同步未完成 · {error}")),
@@ -1050,10 +1109,16 @@ fn pane_message(
                     invalidate(pane);
                 }
             }
-            WM_LBUTTONUP => {
-                if list_hit(pane, param).is_some_and(|index| app.list.selection() == Some(index)) {
+            WM_LBUTTONDOWN => {
+                if let Some(index) = list_hit(pane, param) {
+                    unsafe {
+                        SetFocus(pane);
+                    }
+                    app.list.set_selection(Some(index));
                     app.open_detail();
+                    invalidate(pane);
                 }
+                return Some(0);
             }
             WM_MOUSELEAVE => {
                 app.hover.set(None);
@@ -1111,6 +1176,10 @@ fn pane_message(
                 unsafe {
                     SetFocus(pane);
                 }
+                let (_, _, dpi) = client(pane);
+                let (x, y) = mouse(param);
+                let scroll = app.selection.borrow().detail.scroll;
+                app.profile_at(dip(x, dpi), dip(y, dpi) + scroll);
                 return Some(0);
             }
             WM_MOUSEWHEEL => {
@@ -1379,6 +1448,7 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
             notify.notice();
         }
     });
+    app.sync();
     nwg::dispatch_thread_events();
     for handle in raw {
         let _ = nwg::unbind_raw_event_handler(&handle);
@@ -1468,6 +1538,9 @@ mod interaction_tests {
             platform: None,
             account_puuid: None,
             participants: vec![lcu::Participant {
+                summoner_name: None,
+                tag_line: None,
+                puuid: None,
                 participant_id: Some(1),
                 team_id: Some(300),
                 champion_id: Some(22),
