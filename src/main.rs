@@ -1329,6 +1329,28 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
         .title("国服战绩查询")
         .flags(nwg::WindowFlags::MAIN_WINDOW)
         .build(&mut app.window)?;
+    // Shared handles are owned by Windows and remain valid for the module's lifetime.
+    unsafe {
+        let module = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null());
+        for (kind, size) in [(ICON_SMALL, 16), (ICON_BIG, 32)] {
+            let icon = LoadImageW(
+                module,
+                std::ptr::with_exposed_provenance::<u16>(1),
+                IMAGE_ICON,
+                physical(size, dpi),
+                physical(size, dpi),
+                LR_SHARED,
+            );
+            if !icon.is_null() {
+                SendMessageW(
+                    hwnd(app.window.handle),
+                    WM_SETICON,
+                    kind as usize,
+                    icon as isize,
+                );
+            }
+        }
+    }
     nwg::Button::builder()
         .text("连接并同步")
         .size((134, 36))
