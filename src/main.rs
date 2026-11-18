@@ -21,17 +21,20 @@ use ui::{
     paint::{self, Pixels, Renderer, Surface},
 };
 use windows_sys::Win32::{
-    Foundation::{HWND, RECT},
+    Foundation::{HWND, POINT, RECT},
     Graphics::Gdi::{
-        BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect,
-        PAINTSTRUCT, SetBkColor, SetTextColor,
+        BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetStockObject,
+        InvalidateRect, NULL_PEN, PAINTSTRUCT, RoundRect, ScreenToClient, SelectObject, SetBkColor,
+        SetTextColor,
     },
     UI::{
         HiDpi::{
             DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, GetDpiForWindow,
             SetProcessDpiAwarenessContext,
         },
-        Input::KeyboardAndMouse::{SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent},
+        Input::KeyboardAndMouse::{
+            IsWindowEnabled, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+        },
         WindowsAndMessaging::*,
     },
 };
@@ -201,6 +204,10 @@ impl Selection {
 struct App {
     window: nwg::Window,
     sync: nwg::Button,
+    home: nwg::Button,
+    own_account: RefCell<Option<String>>,
+    profile_request: Cell<bool>,
+    card_brush: *mut core::ffi::c_void,
     update_button: nwg::Button,
     update_notice: nwg::Notice,
     update_tx: mpsc::Sender<UpdateEvent>,
@@ -249,6 +256,7 @@ impl Drop for App {
     fn drop(&mut self) {
         unsafe {
             DeleteObject(self.header_brush);
+            DeleteObject(self.card_brush);
         }
     }
 }
@@ -338,7 +346,7 @@ impl App {
         }
         let width = dip(width as i32, dpi) as i32;
         let height = dip(height as i32, dpi) as i32;
-        let panel_height = (height - 144).max(1);
+        let panel_height = (height - 194).max(1);
         let detail_width = (width - 383).max(1);
         let place = |control, x: i32, y: i32, w: i32, h: i32| unsafe {
             MoveWindow(
@@ -350,32 +358,33 @@ impl App {
                 1,
             );
         };
-        place(self.sync.handle, width - 158, 24, 134, 36);
-        place(self.update_button.handle, width - 292, 24, 122, 36);
-        place(self.account.handle, 24, 12, width - 315, 34);
-        place(self.ranks.handle, 25, 50, width - 50, 24);
-        place(self.status.handle, 25, 74, width - 50, 24);
-        place(self.matches_heading.handle, 24, 98, 160, 22);
-        place(self.detail_heading.handle, 359, 98, 150, 22);
+        place(self.sync.handle, width - 176, 30, 128, 38);
+        place(self.home.handle, width - 306, 30, 118, 38);
+        place(self.update_button.handle, width - 176, 82, 128, 28);
+        place(self.account.handle, 44, 26, width - 370, 34);
+        place(self.ranks.handle, 45, 66, width - 240, 24);
+        place(self.status.handle, 45, 96, width - 240, 24);
+        place(self.matches_heading.handle, 24, 148, 160, 22);
+        place(self.detail_heading.handle, 359, 148, 150, 22);
         place(
             self.cache_progress.handle,
             (width - 330).max(515),
-            98,
+            148,
             306,
             22,
         );
-        place(self.list.handle, 24, 120, 320, panel_height);
+        place(self.list.handle, 24, 170, 320, panel_height);
         place(
             self.detail_frame.handle,
             359,
-            120,
+            170,
             detail_width,
             panel_height,
         );
         place(
             self.detail_text.handle,
             359,
-            120,
+            170,
             detail_width,
             panel_height,
         );
@@ -392,6 +401,7 @@ impl App {
                 self.status.set_font(Some(&font));
                 self.cache_progress.set_font(Some(&font));
                 self.sync.set_font(Some(&font));
+                self.home.set_font(Some(&font));
                 self.update_button.set_font(Some(&font));
                 self.list.set_font(Some(&font));
                 self.detail_text.set_font(Some(&font));
@@ -426,6 +436,17 @@ impl App {
         let cache = self.cache.borrow();
         if let Some(snapshot) = cache.current() {
             self.account.set_text(&snapshot.name);
+            let visiting = self
+                .own_account
+                .borrow()
+                .as_ref()
+                .is_some_and(|own| own != &snapshot.account);
+            self.home.set_visible(visiting);
+            self.matches_heading.set_text(if visiting {
+                "TA 的近期战绩"
+            } else {
+                "我的近期战绩"
+            });
             self.ranks.set_text(&format!(
                 "等级 {}     {}",
                 snapshot.level,
@@ -469,7 +490,8 @@ impl App {
             );
         } else {
             self.account.set_text("尚未同步账号");
-            self.status.set_text("登录英雄联盟后，点击「连接并同步」。");
+            self.status
+                .set_text("登录英雄联盟后自动连接，也可点击「刷新战绩」重试。");
         }
         drop(cache);
         self.refresh_detail();
@@ -615,9 +637,9 @@ impl App {
         }
     }
 
-    fn profile_at(&self, x: f32, y: f32) {
+    fn player_at(&self, x: f32, y: f32) -> Option<usize> {
         if self.sync_busy.get() || self.update_busy.get() {
-            return;
+            return None;
         }
         let index = self
             .detail_layout
@@ -625,7 +647,29 @@ impl App {
             .players
             .iter()
             .find(|(r, _)| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
-            .map(|(_, index)| *index);
+            .map(|(_, index)| *index)?;
+        let cache = self.cache.borrow();
+        let selection = self.selection.borrow();
+        let (_, body) = Self::selected(&cache, &selection);
+        if let Body::Structured(detail) = body {
+            return detail
+                .participants
+                .get(index)
+                .and_then(|p| p.puuid.as_deref())
+                .filter(|id| lcu::valid_puuid(id))
+                .map(|_| index);
+        }
+        None
+    }
+
+    fn profile_at(&self, x: f32, y: f32) {
+        if self.sync_busy.get() || self.update_busy.get() {
+            return;
+        }
+        let Some(index) = self.player_at(x, y) else {
+            return;
+        };
+        let index = Some(index);
         let puuid = {
             let cache = self.cache.borrow();
             let selection = self.selection.borrow();
@@ -643,6 +687,8 @@ impl App {
             return;
         };
         self.sync_busy.set(true);
+        self.profile_request.set(true);
+        self.home.set_enabled(false);
         self.sync.set_enabled(false);
         self.status.set_text("正在读取该召唤师的战绩…");
         if self
@@ -652,16 +698,59 @@ impl App {
         {
             self.sync_busy.set(false);
             self.sync.set_enabled(true);
+            self.home.set_enabled(true);
+        }
+    }
+
+    fn refresh_current(&self) {
+        if self.sync_busy.get() || self.update_busy.get() {
+            return;
+        }
+        let id = self
+            .cache
+            .borrow()
+            .current()
+            .and_then(|s| s.account.split_once(':').map(|(_, id)| id.to_string()));
+        let visiting = self.cache.borrow().current().is_some_and(|s| {
+            self.own_account
+                .borrow()
+                .as_ref()
+                .is_some_and(|own| own != &s.account)
+        });
+        if visiting && let Some(id) = id.filter(|id| lcu::valid_puuid(id)) {
+            self.profile_request.set(true);
+            self.sync_busy.set(true);
+            self.sync.set_enabled(false);
+            self.home.set_enabled(false);
+            self.status.set_text("正在刷新该召唤师的战绩…");
+            if self
+                .requests
+                .send((Request::Profile(id.as_bytes().try_into().unwrap()), None))
+                .is_err()
+            {
+                self.sync_busy.set(false);
+                self.sync.set_enabled(true);
+                self.home.set_enabled(true);
+                self.status.set_text("查询线程已退出，请重新打开工具。");
+            }
+        } else {
+            self.sync();
         }
     }
 
     fn sync(&self) {
+        if self.sync_busy.get() || self.update_busy.get() {
+            return;
+        }
+        self.profile_request.set(false);
+        self.home.set_enabled(false);
         self.sync_busy.set(true);
         self.sync.set_enabled(false);
         self.status.set_text("正在同步游戏客户端…");
         if self.requests.send((Request::Sync, None)).is_err() {
             self.sync_busy.set(false);
             self.sync.set_enabled(true);
+            self.home.set_enabled(true);
             self.status.set_text("查询线程已退出，请重新打开工具。");
         }
     }
@@ -702,8 +791,12 @@ impl App {
             } else {
                 self.sync_busy.set(false);
                 self.sync.set_enabled(true);
+                self.home.set_enabled(true);
                 match reply {
                     Reply::Snapshot(snapshot) => {
+                        if !self.profile_request.get() {
+                            *self.own_account.borrow_mut() = Some(snapshot.account.clone());
+                        }
                         let same = self
                             .cache
                             .borrow()
@@ -916,6 +1009,7 @@ impl App {
         state.scroll = (state.scroll + delta).clamp(0.0, self.detail_layout.borrow().limit(height));
         state.hovered = None;
         state.item = None;
+        state.player_hover = None;
         invalidate(hwnd(self.detail_frame.handle));
     }
 
@@ -959,6 +1053,7 @@ impl App {
             Ok(UpdateEvent::Finished(Err(error))) => {
                 self.update_busy.set(false);
                 self.sync.set_enabled(true);
+                self.home.set_enabled(true);
                 self.update_button.set_enabled(true);
                 self.status.set_text(error);
             }
@@ -977,6 +1072,7 @@ impl App {
         self.update_busy.set(true);
         self.update_button.set_enabled(false);
         self.sync.set_enabled(false);
+        self.home.set_enabled(false);
         self.status.set_text("正在下载并验证更新…");
         let (tx, notify) = (self.update_tx.clone(), self.update_notice.sender());
         std::thread::spawn(move || {
@@ -1024,6 +1120,20 @@ fn bind_panes(app: &Rc<App>) -> Result<Vec<nwg::RawEventHandler>, nwg::NwgError>
                     unsafe {
                         GetClientRect(window.cast(), &mut rect);
                         FillRect(key as HWND, &rect, app.header_brush);
+                        let dpi = client(window.cast()).2;
+                        let brush = SelectObject(key as _, app.card_brush);
+                        let pen = SelectObject(key as _, GetStockObject(NULL_PEN));
+                        RoundRect(
+                            key as _,
+                            physical(24, dpi),
+                            physical(16, dpi),
+                            rect.right - physical(24, dpi),
+                            physical(136, dpi),
+                            physical(20, dpi),
+                            physical(20, dpi),
+                        );
+                        SelectObject(key as _, pen);
+                        SelectObject(key as _, brush);
                     }
                     Some(1)
                 }
@@ -1038,7 +1148,16 @@ fn bind_panes(app: &Rc<App>) -> Result<Vec<nwg::RawEventHandler>, nwg::NwgError>
                     };
                     unsafe {
                         SetTextColor(key as HWND, color(foreground));
-                        SetBkColor(key as HWND, color(paint::BG));
+                        let in_card = [app.account.handle, app.ranks.handle, app.status.handle]
+                            .iter()
+                            .any(|handle| hwnd(*handle) == param as HWND);
+                        SetBkColor(
+                            key as HWND,
+                            color(if in_card { paint::PANEL } else { paint::BG }),
+                        );
+                        if in_card {
+                            return Some(app.card_brush as isize);
+                        }
                     }
                     Some(app.header_brush as isize)
                 }
@@ -1077,6 +1196,135 @@ fn bind_panes(app: &Rc<App>) -> Result<Vec<nwg::RawEventHandler>, nwg::NwgError>
             },
         )?);
     }
+    for (index, control) in [app.sync.handle, app.home.handle, app.update_button.handle]
+        .into_iter()
+        .enumerate()
+    {
+        let weak = Rc::downgrade(app);
+        let target: RefCell<Option<Surface>> = RefCell::new(None);
+        let hovered = Cell::new(false);
+        handlers.push(nwg::bind_raw_event_handler(
+            &control,
+            0x10010 + index,
+            move |window, message, _, param| {
+                let app = weak.upgrade()?;
+                let window = window.cast();
+                match message {
+                    WM_SETCURSOR if param as u16 == HTCLIENT as u16 => {
+                        unsafe {
+                            SetCursor(LoadCursorW(
+                                std::ptr::null_mut(),
+                                if IsWindowEnabled(window) != 0 {
+                                    IDC_HAND
+                                } else {
+                                    IDC_ARROW
+                                },
+                            ));
+                        }
+                        return Some(1);
+                    }
+                    WM_MOUSEMOVE => {
+                        leave_tracking(window);
+                        if !hovered.replace(true) {
+                            invalidate(window);
+                        }
+                    }
+                    WM_MOUSELEAVE => {
+                        hovered.set(false);
+                        invalidate(window);
+                    }
+                    WM_SETFOCUS | WM_KILLFOCUS | WM_ENABLE | WM_LBUTTONDOWN | WM_LBUTTONUP
+                    | WM_KEYDOWN | WM_KEYUP => invalidate(window),
+                    WM_PAINT => {
+                        let renderer = app.renderer.as_ref()?;
+                        let (w, h, dpi) = client(window);
+                        let mut target = target.borrow_mut();
+                        if target
+                            .as_mut()
+                            .is_some_and(|s| s.resize(w, h, dpi).is_err())
+                        {
+                            *target = None;
+                        }
+                        if target.is_none() {
+                            *target = renderer
+                                .target(windows::Win32::Foundation::HWND(window), w, h, dpi)
+                                .ok();
+                        }
+                        let surface = target.as_mut()?;
+                        let mut region: PAINTSTRUCT = unsafe { std::mem::zeroed() };
+                        unsafe {
+                            BeginPaint(window, &mut region);
+                        }
+                        let enabled = unsafe { IsWindowEnabled(window) != 0 };
+                        let pressed = unsafe { SendMessageW(window, BM_GETSTATE, 0, 0) }
+                            & BST_PUSHED as isize
+                            != 0;
+                        let color = if !enabled {
+                            paint::CARD
+                        } else if pressed {
+                            0x344772
+                        } else if hovered.get() {
+                            0x354466
+                        } else if index == 0 {
+                            0x293b64
+                        } else {
+                            paint::CARD
+                        };
+                        let width = dip(w as i32, dpi);
+                        let height = dip(h as i32, dpi);
+                        surface.begin(paint::PANEL);
+                        let bounds = paint::rect(1.0, 1.0, width - 2.0, height - 2.0);
+                        surface.fill(bounds, color, 9.0);
+                        let focused = unsafe {
+                            windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() == window
+                        };
+                        surface.border(
+                            bounds,
+                            if focused || hovered.get() && enabled {
+                                paint::ACCENT
+                            } else {
+                                paint::BORDER
+                            },
+                            9.0,
+                        );
+                        let text = if index == 0 {
+                            if enabled {
+                                "↻  刷新战绩".to_string()
+                            } else {
+                                "同步中…".to_string()
+                            }
+                        } else if index == 1 {
+                            "‹  回到自己".to_string()
+                        } else {
+                            app.update_button.text()
+                        };
+                        surface.text(
+                            renderer,
+                            &text,
+                            paint::rect(
+                                if index == 2 { 10.0 } else { 16.0 },
+                                (height - 22.0) / 2.0,
+                                width - 20.0,
+                                24.0,
+                            ),
+                            paint::Font::Base,
+                            if enabled { paint::TEXT } else { paint::MUTED },
+                        );
+                        let result = surface.finish();
+                        unsafe {
+                            EndPaint(window, &region);
+                        }
+                        if result.is_err() {
+                            *target = None;
+                        }
+                        return Some(0);
+                    }
+                    _ => (),
+                }
+                None
+            },
+        )?);
+    }
     Ok(handlers)
 }
 
@@ -1091,6 +1339,31 @@ fn pane_message(
     param: isize,
 ) -> Option<isize> {
     match message {
+        WM_SETCURSOR if param as u16 == HTCLIENT as u16 => {
+            let mut point = POINT { x: 0, y: 0 };
+            unsafe {
+                GetCursorPos(&mut point);
+                ScreenToClient(pane, &mut point);
+            }
+            let (_, _, dpi) = client(pane);
+            let clickable = if left {
+                let packed = ((point.y as u16 as u32) << 16) | point.x as u16 as u32;
+                list_hit(pane, packed as isize).is_some()
+            } else {
+                app.player_at(
+                    dip(point.x, dpi),
+                    dip(point.y, dpi) + app.selection.borrow().detail.scroll,
+                )
+                .is_some()
+            };
+            unsafe {
+                SetCursor(LoadCursorW(
+                    std::ptr::null_mut(),
+                    if clickable { IDC_HAND } else { IDC_ARROW },
+                ));
+            }
+            return Some(1);
+        }
         WM_PAINT => return app.paint(pane, left),
         WM_ERASEBKGND
             if !(if left {
@@ -1167,7 +1440,13 @@ fn pane_message(
                 leave_tracking(pane);
                 let (_, _, dpi) = client(pane);
                 let (x, y) = mouse(param);
+                let scroll = app.selection.borrow().detail.scroll;
+                let player = app.player_at(dip(x, dpi), dip(y, dpi) + scroll);
                 let state = &mut app.selection.borrow_mut().detail;
+                if state.player_hover != player {
+                    state.player_hover = player;
+                    invalidate(pane);
+                }
                 let hovered = app
                     .detail_layout
                     .borrow()
@@ -1180,6 +1459,7 @@ fn pane_message(
             WM_MOUSELEAVE | WM_KILLFOCUS => {
                 let mut selection = app.selection.borrow_mut();
                 selection.detail.hovered = None;
+                selection.detail.player_hover = None;
                 if message == WM_KILLFOCUS {
                     selection.detail.item = None;
                 }
@@ -1295,6 +1575,10 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
     let mut app = App {
         window: Default::default(),
         sync: Default::default(),
+        home: Default::default(),
+        own_account: Default::default(),
+        profile_request: Default::default(),
+        card_brush: unsafe { CreateSolidBrush(0x301f18) },
         update_button: Default::default(),
         status: Default::default(),
         account: Default::default(),
@@ -1368,10 +1652,15 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
         }
     }
     nwg::Button::builder()
-        .text("连接并同步")
+        .text("刷新战绩")
         .size((134, 36))
         .parent(&app.window)
         .build(&mut app.sync)?;
+    nwg::Button::builder()
+        .text("回到自己")
+        .parent(&app.window)
+        .build(&mut app.home)?;
+    app.home.set_visible(false);
     nwg::Button::builder()
         .text("检查更新")
         .size((122, 36))
@@ -1450,7 +1739,8 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
                     .set_min_size(physical(780, dpi), physical(520, dpi));
             }
             OnResize | OnWindowMaximize if handle == app.window => app.layout(),
-            OnButtonClick if handle == app.sync => app.sync(),
+            OnButtonClick if handle == app.sync => app.refresh_current(),
+            OnButtonClick if handle == app.home => app.sync(),
             OnListBoxSelect | OnListBoxDoubleClick if handle == app.list => app.open_detail(),
             OnNotice if handle == app.notice => app.finish(),
             OnNotice if handle == app.image_notice => app.image_arrived(),

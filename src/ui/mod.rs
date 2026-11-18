@@ -19,6 +19,7 @@ pub struct DetailState {
     pub scroll: f32,
     pub item: Option<usize>,
     pub hovered: Option<usize>,
+    pub player_hover: Option<usize>,
 }
 
 impl DetailState {
@@ -423,6 +424,22 @@ pub fn paint_detail(
                     images,
                     needed,
                 );
+                if state.player_hover == Some(*index) {
+                    surface.fill(
+                        rect(
+                            65.0,
+                            y + 2.0,
+                            if width >= 600.0 {
+                                width - 470.0
+                            } else {
+                                width - 239.0
+                            },
+                            41.0,
+                        ),
+                        CARD,
+                        5.0,
+                    );
+                }
                 let name = format!(
                     "{}{}",
                     player
@@ -438,7 +455,11 @@ pub fn paint_detail(
                     &name,
                     rect(70.0, y + 2.0, numbers - 76.0, 23.0),
                     Font::Base,
-                    ACCENT,
+                    if player.puuid.as_deref().is_some_and(crate::lcu::valid_puuid) {
+                        ACCENT
+                    } else {
+                        TEXT
+                    },
                 );
                 let identity = player
                     .tag_line
