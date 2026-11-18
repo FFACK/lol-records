@@ -233,6 +233,8 @@ struct App {
     list_repainted: Cell<bool>,
     header_brush: *mut core::ffi::c_void,
     image_notice: nwg::Notice,
+    cache_progress: nwg::Label,
+    cache_progress_rx: mpsc::Receiver<String>,
     pixels: RefCell<HashMap<ImageKey, Pixels>>,
     image_requested: RefCell<HashSet<ImageKey>>,
     image_jobs: mpsc::Sender<ImageKey>,
@@ -354,7 +356,14 @@ impl App {
         place(self.ranks.handle, 25, 50, width - 50, 24);
         place(self.status.handle, 25, 74, width - 50, 24);
         place(self.matches_heading.handle, 24, 98, 160, 22);
-        place(self.detail_heading.handle, 359, 98, 255, 22);
+        place(self.detail_heading.handle, 359, 98, 150, 22);
+        place(
+            self.cache_progress.handle,
+            (width - 330).max(515),
+            98,
+            306,
+            22,
+        );
         place(self.list.handle, 24, 120, 320, panel_height);
         place(
             self.detail_frame.handle,
@@ -381,6 +390,7 @@ impl App {
             if let Some((_old, font)) = resize_font(&self.body_font, 14, 400, dpi) {
                 self.ranks.set_font(Some(&font));
                 self.status.set_font(Some(&font));
+                self.cache_progress.set_font(Some(&font));
                 self.sync.set_font(Some(&font));
                 self.update_button.set_font(Some(&font));
                 self.list.set_font(Some(&font));
@@ -723,6 +733,9 @@ impl App {
     }
 
     fn image_arrived(&self) {
+        for progress in self.cache_progress_rx.try_iter() {
+            self.cache_progress.set_text(&progress);
+        }
         let Some(renderer) = &self.renderer else {
             return;
         };
@@ -1275,6 +1288,7 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
     let (requests, jobs) = mpsc::channel();
     let (image_jobs, image_work) = mpsc::channel();
     let (image_tx, image_results) = mpsc::channel();
+    let (cache_progress_tx, cache_progress_rx) = mpsc::channel();
     let (update_tx, update_rx) = mpsc::channel();
     let renderer = Renderer::new().ok();
     let fallback = renderer.is_none();
@@ -1312,6 +1326,8 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
         pixels: Default::default(),
         image_requested: Default::default(),
         image_notice: Default::default(),
+        cache_progress: Default::default(),
+        cache_progress_rx,
         image_jobs,
         image_results,
         update_notice: Default::default(),
@@ -1416,6 +1432,11 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
     ] {
         nwg::Notice::builder().parent(&app.window).build(notice)?;
     }
+    nwg::Label::builder()
+        .text("检查图片缓存…")
+        .size((306, 22))
+        .parent(&app.window)
+        .build(&mut app.cache_progress)?;
     let app = Rc::new(app);
     let weak = Rc::downgrade(&app);
     let handler = nwg::full_bind_event_handler(&app.window.handle, move |event, data, handle| {
@@ -1444,11 +1465,74 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
     let image_notice = app.image_notice.sender();
     std::thread::spawn(move || {
         let agent = assets::portrait_client();
-        for key in image_work {
-            if image_tx.send((key, assets::image(&agent, key))).is_err() {
-                break;
+        let all = assets::initialization_keys();
+        let total = all.len();
+        let mut pending = std::collections::VecDeque::new();
+        let mut cached = 0;
+        for key in all {
+            if assets::is_cached(key) {
+                cached += 1;
+            } else {
+                pending.push_back(key);
             }
+        }
+        let mut failures = 0;
+        let mut consecutive_failures = 0;
+        let publish = |message: String| {
+            let _ = cache_progress_tx.send(message);
             image_notice.notice();
+        };
+        publish(if pending.is_empty() {
+            format!("图片缓存已就绪 · {cached}")
+        } else {
+            format!("初始化图片缓存 · {cached}/{total}")
+        });
+        loop {
+            // Visible images take priority over the first-run bulk fill.
+            match image_work.recv_timeout(std::time::Duration::from_millis(20)) {
+                Ok(key) => {
+                    if image_tx.send((key, assets::image(&agent, key))).is_err() {
+                        break;
+                    }
+                    image_notice.notice();
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => (),
+            }
+            let Some(key) = pending.pop_front() else {
+                match image_work.recv() {
+                    Ok(key) => {
+                        if image_tx.send((key, assets::image(&agent, key))).is_err() {
+                            break;
+                        }
+                        image_notice.notice();
+                    }
+                    Err(_) => break,
+                }
+                continue;
+            };
+            if assets::is_cached(key)
+                || (assets::image(&agent, key).is_some() && assets::is_cached(key))
+            {
+                cached += 1;
+                consecutive_failures = 0;
+            } else {
+                failures += 1;
+                consecutive_failures += 1;
+            }
+            if consecutive_failures >= 4 {
+                pending.clear();
+                publish(format!("图片缓存 {cached}/{total} · 下次启动继续"));
+            } else if pending.is_empty() {
+                publish(if failures == 0 {
+                    format!("图片缓存已就绪 · {cached}")
+                } else {
+                    format!("图片缓存 {cached}/{total} · 下次补齐")
+                });
+            } else if (cached + failures) % 10 == 0 {
+                publish(format!("初始化图片缓存 · {cached}/{total}"));
+            }
         }
     });
     let notice = app.notice.sender();

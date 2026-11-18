@@ -186,28 +186,59 @@ pub enum ImageKey {
     Item(u64),
 }
 
+pub fn initialization_keys() -> Vec<ImageKey> {
+    let mut champions: Vec<_> = REFERENCE.champions.keys().copied().collect();
+    let mut items: Vec<_> = REFERENCE.items.keys().copied().collect();
+    champions.sort_unstable();
+    items.sort_unstable();
+    champions
+        .into_iter()
+        .map(ImageKey::Champion)
+        .chain(items.into_iter().map(ImageKey::Item))
+        .collect()
+}
+
+fn cache_path(key: ImageKey) -> Option<PathBuf> {
+    let (folder, id) = match key {
+        ImageKey::Champion(id) => ("portraits", id),
+        ImageKey::Item(id) => ("items", id),
+    };
+    Some(
+        PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
+            .join("LolRecords")
+            .join(folder)
+            .join(&REFERENCE.version)
+            .join(format!("{id}.png")),
+    )
+}
+
+pub fn is_cached(key: ImageKey) -> bool {
+    let Some(path) = cache_path(key) else {
+        return false;
+    };
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    if !file
+        .metadata()
+        .is_ok_and(|info| info.len() >= 8 && info.len() <= 256 * 1024)
+    {
+        return false;
+    }
+    let mut signature = [0; 8];
+    file.read_exact(&mut signature).is_ok() && signature == *b"\x89PNG\r\n\x1a\n"
+}
+
 pub fn image(agent: &ureq::Agent, key: ImageKey) -> Option<Vec<u8>> {
     const MAX_BYTES: usize = 256 * 1024;
-    let (folder, group, id, filename) = match key {
-        ImageKey::Champion(id) => (
-            "portraits",
-            "champion",
-            id,
-            REFERENCE.champions.get(&id)?.1.clone(),
-        ),
+    let (group, filename) = match key {
+        ImageKey::Champion(id) => ("champion", REFERENCE.champions.get(&id)?.1.clone()),
         ImageKey::Item(id) => {
             REFERENCE.items.get(&id)?;
-            ("items", "item", id, format!("{id}.png"))
+            ("item", format!("{id}.png"))
         }
     };
-    let path = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .map(|root| {
-            root.join("LolRecords")
-                .join(folder)
-                .join(&REFERENCE.version)
-                .join(format!("{id}.png"))
-        });
+    let path = cache_path(key);
     let valid_png = |data: &[u8]| data.len() <= MAX_BYTES && data.starts_with(b"\x89PNG\r\n\x1a\n");
     if let Some(path) = &path
         && let Ok(file) = std::fs::File::open(path)
@@ -257,6 +288,19 @@ pub fn image(agent: &ureq::Agent, key: ImageKey) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initialization_covers_both_resource_types_once() {
+        let keys = initialization_keys();
+        let unique: std::collections::HashSet<_> = keys.iter().copied().collect();
+        assert_eq!(unique.len(), keys.len());
+        assert_eq!(
+            keys.len(),
+            REFERENCE.champions.len() + REFERENCE.items.len()
+        );
+        assert!(unique.contains(&ImageKey::Champion(22)));
+        assert!(unique.contains(&ImageKey::Item(1001)));
+    }
 
     #[test]
     fn translates_saved_match_details_without_rewriting_the_cache() {
