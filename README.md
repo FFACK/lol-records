@@ -1,6 +1,6 @@
 # 国服战绩查询 · LoL Records
 
-**Windows x64 单文件免安装工具**，查询你在英雄联盟国服的段位、近期战绩和单局详情。
+**Windows x64 战绩工具**，提供包含图片素材的离线安装包，也保留单文件免安装 EXE，查询你在英雄联盟国服的段位、近期战绩和单局详情。
 
 [查看 GitHub 发行版](https://github.com/FFACK/lol-records/releases) · [反馈问题](https://github.com/FFACK/lol-records/issues)
 
@@ -13,7 +13,7 @@
 
 ## 下载与使用
 
-1. 从 [GitHub 发行版](https://github.com/FFACK/lol-records/releases) 的附件下载 `lol-records.exe`。若发行版列表为空，暂未提供公开下载。
+1. 从 [GitHub 发行版](https://github.com/FFACK/lol-records/releases) 的附件下载安装包 `lol-records-setup-vX.Y.Z-x64.exe`，安装时直接部署英雄和装备图标，无需等待首次联网补齐。也可只下载 `lol-records.exe` 双击使用，缺失图片会后台下载。若发行版列表为空，暂未提供公开下载。
 2. 登录国服英雄联盟大厅，双击 EXE，程序自动连接并同步。
 3. 若 Windows 弹出 UAC 提示，确认后即可同步。本次打开工具期间，刷新和查看单局详情复用该连接。关闭工具或连接断开后，再连接可能需要重新确认。取消后仍可查看已缓存的战绩。
 
@@ -27,6 +27,10 @@
 从仓库根目录执行 `cargo build --release --locked --target x86_64-pc-windows-msvc`。需要 Rust 和 MSVC Windows 构建工具。运行时使用 Windows 自带的 PowerShell 查询客户端进程，用户无需安装 Rust 或浏览器组件。
 
 ## GitHub 发版
+
+制作完整安装包：安装 PowerShell 7、Inno Setup 6 后运行 `pwsh -File scripts/package-installer.ps1`，可用 `-Compiler` 指定 ISCC.exe 路径。脚本先构建并签名便携 EXE，再从当前用户缓存或 Riot CDN 准备当前版本全部英雄头像和装备图标，任何文件缺失都会中止打包。图片只进入安装包，不嵌入便携 EXE。`dist/assets-manifest.json` 记录素材 SHA-256；重跑会复用已下载的素材。
+
+安装包默认安装到 `%LOCALAPPDATA%\Programs\LoL Records`，无需管理员安装；连接游戏时仍遵循原有 UAC 流程。图片部署到 `%LOCALAPPDATA%\LolRecords`，卸载保留图片及战绩缓存。发布时除便携 EXE 和签名外，上传 `dist/lol-records-setup-vX.Y.Z-x64.exe` 与对应 `.sha256`。应用内更新仍只下载小体积 EXE，新素材按需补齐；完整离线素材升级可重新运行新版安装包。
 
 1. 递增 `Cargo.toml` 版本，同步 `Cargo.lock`，打对应的 `vX.Y.Z` 标签。
 2. 从项目目录运行 `scripts\release.ps1`。签名需要 OpenSSL 支持 Ed25519，私钥由发版者保管。默认从 `%LOCALAPPDATA%\LolRecordsSigning\release-ed25519.pem` 读取。
