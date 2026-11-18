@@ -1462,6 +1462,37 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
     let raw = bind_panes(&app)?;
     app.layout();
     app.load_snapshot(false);
+    let (network_tx, network_rx) = mpsc::channel();
+    let network_rx = std::sync::Arc::new(std::sync::Mutex::new(network_rx));
+    for _ in 0..2 {
+        let jobs = network_rx.clone();
+        let results = image_tx.clone();
+        let notice = app.image_notice.sender();
+        std::thread::spawn(move || {
+            let agent = assets::portrait_client();
+            loop {
+                let job = jobs.lock().ok().and_then(|receiver| receiver.recv().ok());
+                let Some(key) = job else { break };
+                if results.send((key, assets::image(&agent, key))).is_err() {
+                    break;
+                }
+                notice.notice();
+            }
+        });
+    }
+    let disk_notice = app.image_notice.sender();
+    std::thread::spawn(move || {
+        for key in image_work {
+            if let Some(bytes) = assets::cached_image(key) {
+                if image_tx.send((key, Some(bytes))).is_err() {
+                    break;
+                }
+                disk_notice.notice();
+            } else if network_tx.send(key).is_err() {
+                break;
+            }
+        }
+    });
     let image_notice = app.image_notice.sender();
     std::thread::spawn(move || {
         let agent = assets::portrait_client();
@@ -1487,31 +1518,9 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
         } else {
             format!("初始化图片缓存 · {cached}/{total}")
         });
-        loop {
-            // Visible images take priority over the first-run bulk fill.
-            match image_work.recv_timeout(std::time::Duration::from_millis(20)) {
-                Ok(key) => {
-                    if image_tx.send((key, assets::image(&agent, key))).is_err() {
-                        break;
-                    }
-                    image_notice.notice();
-                    continue;
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => (),
-            }
-            let Some(key) = pending.pop_front() else {
-                match image_work.recv() {
-                    Ok(key) => {
-                        if image_tx.send((key, assets::image(&agent, key))).is_err() {
-                            break;
-                        }
-                        image_notice.notice();
-                    }
-                    Err(_) => break,
-                }
-                continue;
-            };
+        while let Some(key) = pending.pop_front() {
+            // Cache initialization never shares a queue with visible image reads.
+
             if assets::is_cached(key)
                 || (assets::image(&agent, key).is_some() && assets::is_cached(key))
             {

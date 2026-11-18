@@ -229,6 +229,14 @@ pub fn is_cached(key: ImageKey) -> bool {
     file.read_exact(&mut signature).is_ok() && signature == *b"\x89PNG\r\n\x1a\n"
 }
 
+pub fn cached_image(key: ImageKey) -> Option<Vec<u8>> {
+    let file = std::fs::File::open(cache_path(key)?).ok()?;
+    let mut bytes = Vec::new();
+    file.take(256 * 1024 + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() <= 256 * 1024 && bytes.starts_with(&[137, 80, 78, 71, 13, 10, 26, 10]))
+        .then_some(bytes)
+}
+
 pub fn image(agent: &ureq::Agent, key: ImageKey) -> Option<Vec<u8>> {
     const MAX_BYTES: usize = 256 * 1024;
     let (group, filename) = match key {
@@ -240,18 +248,8 @@ pub fn image(agent: &ureq::Agent, key: ImageKey) -> Option<Vec<u8>> {
     };
     let path = cache_path(key);
     let valid_png = |data: &[u8]| data.len() <= MAX_BYTES && data.starts_with(b"\x89PNG\r\n\x1a\n");
-    if let Some(path) = &path
-        && let Ok(file) = std::fs::File::open(path)
-    {
-        let mut data = Vec::new();
-        if file
-            .take(MAX_BYTES as u64 + 1)
-            .read_to_end(&mut data)
-            .is_ok()
-            && valid_png(&data)
-        {
-            return Some(data);
-        }
+    if let Some(data) = cached_image(key) {
+        return Some(data);
     }
     let mut response = agent
         .get(format!(
@@ -274,7 +272,9 @@ pub fn image(agent: &ureq::Agent, key: ImageKey) -> Option<Vec<u8>> {
         && let Some(folder) = path.parent()
         && std::fs::create_dir_all(folder).is_ok()
     {
-        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+        static FILE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = FILE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("{}.{sequence}.tmp", std::process::id()));
         if std::fs::write(&tmp, &data)
             .and_then(|_| std::fs::rename(&tmp, &path))
             .is_err()
