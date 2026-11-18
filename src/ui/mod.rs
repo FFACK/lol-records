@@ -54,7 +54,8 @@ enum RowKind {
 
 pub struct Slot {
     pub rect: D2D_RECT_F,
-    pub id: u64,
+    pub key: ImageKey,
+    pub label: String,
     pub trinket: bool,
     pub slot: usize,
 }
@@ -82,7 +83,6 @@ impl DetailLayout {
                 }
             }
             Body::Structured(detail) => {
-                let wide = width >= 600.0;
                 for team in detail.teams.iter().copied().map(Some).chain([None]) {
                     let players: Vec<_> = detail
                         .participants
@@ -96,20 +96,30 @@ impl DetailLayout {
                     layout.push(34.0, RowKind::Team(team));
                     for (index, player) in players {
                         let row_top = layout.height;
-                        let numbers = if wide { width - 394.0 } else { width - 163.0 };
+                        let numbers = width - 166.0;
                         layout
                             .players
                             .push((rect(70.0, row_top + 4.0, numbers - 76.0, 37.0), index));
-                        layout.push(if wide { 51.0 } else { 78.0 }, RowKind::Player(index));
+                        layout.push(114.0, RowKind::Player(index));
                         for (slot, id) in player.items.iter().enumerate() {
                             if let Some(id) = id {
                                 layout.items.push(Slot {
                                     rect: item_rect(width, row_top, slot),
-                                    id: *id,
+                                    key: ImageKey::Item(*id),
+                                    label: assets::item_name(*id),
                                     trinket: slot == 6,
                                     slot,
                                 });
                             }
+                        }
+                        for (key, bounds, label) in combat_slots(width, row_top, player) {
+                            layout.items.push(Slot {
+                                rect: bounds,
+                                key,
+                                label,
+                                trinket: false,
+                                slot: 0,
+                            });
                         }
                     }
                     layout.height += 10.0;
@@ -141,17 +151,93 @@ impl DetailLayout {
 }
 
 fn item_rect(width: f32, y: f32, index: usize) -> D2D_RECT_F {
-    let (left, top) = if width >= 600.0 {
-        (width - 253.0, y + 11.0)
-    } else {
-        (70.0, y + 42.0)
-    };
+    let _ = width;
+    let (left, top) = (70.0, y + 80.0);
     rect(
         left + index as f32 * 31.0 + if index == 6 { 7.0 } else { 0.0 },
         top,
         27.0,
         27.0,
     )
+}
+
+fn compact(value: Option<u64>) -> String {
+    value
+        .map(|v| {
+            if v >= 1000 {
+                format!("{:.1}k", v as f32 / 1000.0)
+            } else {
+                v.to_string()
+            }
+        })
+        .unwrap_or_else(|| "—".into())
+}
+
+fn team_summary(detail: &Detail, team: Option<u64>) -> String {
+    let players: Vec<_> = detail
+        .participants
+        .iter()
+        .filter(|p| p.team_id == team)
+        .collect();
+    let outcome = players
+        .iter()
+        .find_map(|p| p.win)
+        .map(|win| if win { "胜方" } else { "败方" })
+        .unwrap_or("阵容");
+    let sum = |read: fn(&crate::lcu::Participant) -> Option<u64>| {
+        players
+            .iter()
+            .try_fold(0u64, |n, p| n.checked_add(read(p)?))
+    };
+    format!(
+        "{outcome} · {}    {} / {} / {}    经济 {}",
+        if detail.context.is_some() && detail.teams == [300] {
+            "我方队友".into()
+        } else {
+            assets::team_name(team, detail.teams == [100, 200])
+        },
+        assets::stat(sum(|p| p.kills)),
+        assets::stat(sum(|p| p.deaths)),
+        assets::stat(sum(|p| p.assists)),
+        compact(sum(|p| p.gold))
+    )
+}
+fn combat_slots(
+    width: f32,
+    y: f32,
+    p: &crate::lcu::Participant,
+) -> Vec<(ImageKey, D2D_RECT_F, String)> {
+    let mut slots = Vec::new();
+    if let Some(rank) = &p.rank
+        && rank.tier > 0
+    {
+        slots.push((
+            ImageKey::Rank(rank.tier),
+            rect(23.0, y + 79.0, 28.0, 28.0),
+            format!("{} · 查询 {}", rank.label, time(rank.checked_at)),
+        ));
+    }
+    for (index, id) in p.spells.iter().enumerate() {
+        if let Some(id) = id {
+            let key = ImageKey::Spell(*id);
+            slots.push((
+                key,
+                rect(width - 136.0 + index as f32 * 27.0, y + 46.0, 23.0, 23.0),
+                assets::image_name(key),
+            ));
+        }
+    }
+    for (index, id) in p.runes.iter().enumerate() {
+        if let Some(id) = id {
+            let key = ImageKey::Rune(*id);
+            slots.push((
+                key,
+                rect(width - 78.0 + index as f32 * 27.0, y + 46.0, 23.0, 23.0),
+                assets::image_name(key),
+            ));
+        }
+    }
+    slots
 }
 
 pub fn result(win: Option<bool>) -> (&'static str, u32) {
@@ -366,6 +452,25 @@ pub fn paint_detail(
         }
     }
 
+    if game.is_none()
+        && let Body::Structured(detail) = &body
+    {
+        surface.fill(rect(12.0, 10.0 - offset, width - 24.0, 95.0), PANEL, 10.0);
+        surface.text(
+            renderer,
+            detail.context.as_deref().unwrap_or("当前对局"),
+            rect(25.0, 22.0 - offset, width - 50.0, 28.0),
+            Font::Strong,
+            TEXT,
+        );
+        surface.text(
+            renderer,
+            "点击玩家查战绩 · 段位为当前查询结果 · 未提供的字段显示 —",
+            rect(25.0, 58.0 - offset, width - 50.0, 40.0),
+            Font::Small,
+            MUTED,
+        );
+    }
     if let Body::Empty(message) = &body {
         let top = if game.is_some() { DETAIL_HEADER } else { 22.0 };
         surface.text(
@@ -393,10 +498,10 @@ pub fn paint_detail(
             ),
             RowKind::Team(team) => surface.text(
                 renderer,
-                &assets::team_name(
-                    *team,
-                    matches!(&body, Body::Structured(detail) if detail.teams == [100, 200]),
-                ),
+                &match &body {
+                    Body::Structured(detail) => team_summary(detail, *team),
+                    _ => assets::team_name(*team, false),
+                },
                 rect(23.0, y, title_width, row.h),
                 Font::Strong,
                 match team {
@@ -425,20 +530,7 @@ pub fn paint_detail(
                     needed,
                 );
                 if state.player_hover == Some(*index) {
-                    surface.fill(
-                        rect(
-                            65.0,
-                            y + 2.0,
-                            if width >= 600.0 {
-                                width - 470.0
-                            } else {
-                                width - 239.0
-                            },
-                            41.0,
-                        ),
-                        CARD,
-                        5.0,
-                    );
+                    surface.fill(rect(65.0, y + 2.0, width - 242.0, 41.0), CARD, 5.0);
                 }
                 let name = format!(
                     "{}{}",
@@ -448,8 +540,7 @@ pub fn paint_detail(
                         .unwrap_or("召唤师信息待刷新"),
                     if me { "  我" } else { "" }
                 );
-                let wide = width >= 600.0;
-                let numbers = if wide { width - 394.0 } else { width - 163.0 };
+                let numbers = width - 166.0;
                 surface.text(
                     renderer,
                     &name,
@@ -494,6 +585,31 @@ pub fn paint_detail(
                     Font::Small,
                     MUTED,
                 );
+                let economy = format!("金 {}  伤 {}", compact(player.gold), compact(player.damage));
+                surface.text(
+                    renderer,
+                    &economy,
+                    rect(numbers, y + 29.0, 153.0, 20.0),
+                    Font::Small,
+                    MUTED,
+                );
+                for (key, bounds, _) in combat_slots(width, y, player) {
+                    draw_image(surface, key, bounds, images, needed);
+                }
+                let rank_label = player.rank.as_ref().map(|r| r.label.as_str()).unwrap_or(
+                    if player.puuid.as_deref().is_some_and(crate::lcu::valid_puuid) {
+                        "当前段位待查询"
+                    } else {
+                        "当前段位未提供"
+                    },
+                );
+                surface.text(
+                    renderer,
+                    rank_label,
+                    rect(23.0, y + 43.0, (width - 186.0).max(90.0), 17.0),
+                    Font::Small,
+                    MUTED,
+                );
                 for (slot, id) in player.items.iter().enumerate() {
                     let bounds = item_rect(width, y, slot);
                     if let Some(id) = id {
@@ -524,9 +640,11 @@ pub fn paint_detail(
         if bounds.bottom > 0.0 && bounds.top < height {
             surface.border(bounds, ACCENT, 4.0);
             let label = if slot.trinket {
-                format!("饰品 · {}", assets::item_name(slot.id))
+                format!("饰品 · {}", slot.label)
+            } else if matches!(slot.key, ImageKey::Item(_)) {
+                format!("装备槽 {} · {}", slot.slot + 1, slot.label)
             } else {
-                format!("装备槽 {} · {}", slot.slot + 1, assets::item_name(slot.id))
+                slot.label.clone()
             };
             let top = if bounds.top > 52.0 {
                 bounds.top - 35.0

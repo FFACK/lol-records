@@ -110,7 +110,7 @@ pub fn connect() -> Result<Connection, String> {
 
 impl Connection {
     pub fn query(&mut self, request: Request) -> Result<Reply, &'static str> {
-        let mut command = [0; 37];
+        let mut command = [0; 129];
         if let Request::Detail(id) = request {
             command[0] = 1;
             command[1..9].copy_from_slice(&id.to_le_bytes());
@@ -119,9 +119,23 @@ impl Connection {
             command[0] = 2;
             command[1..37].copy_from_slice(&puuid);
         }
+        if let Request::Search(bytes) = request {
+            if lcu::search_text(&bytes).is_none() {
+                return Err("搜索名称无效。");
+            }
+            command[0] = 3;
+            command[1..129].copy_from_slice(&bytes);
+        }
+        if matches!(request, Request::Live) {
+            command[0] = 4;
+        }
+        if let Request::Rank(bytes) = request {
+            command[0] = 5;
+            command[1..37].copy_from_slice(&bytes);
+        }
         self.stream
             .write_all(&command)
-            .map_err(|_| "同步连接已断开。请点击「连接并同步」重新连接。")?;
+            .map_err(|_| "同步连接已断开。请点击「刷新战绩」重新连接。")?;
         let deadline = Instant::now() + Duration::from_secs(45);
         let mut data = Vec::new();
         let mut buffer = [0u8; 8192];
@@ -187,7 +201,7 @@ pub fn worker(pipe: &str, parent_pid: u32) {
         return;
     }
 
-    let mut command = [0; 37];
+    let mut command = [0; 129];
     while stream.read_exact(&mut command).is_ok() {
         let request = match command[0] {
             0 => Request::Sync,
@@ -198,6 +212,21 @@ pub fn worker(pipe: &str, parent_pid: u32) {
                     break;
                 }
                 Request::Profile(bytes)
+            }
+            3 => {
+                let bytes: [u8; 128] = command[1..129].try_into().unwrap();
+                if lcu::search_text(&bytes).is_none() {
+                    break;
+                }
+                Request::Search(bytes)
+            }
+            4 => Request::Live,
+            5 => {
+                let bytes: [u8; 36] = command[1..37].try_into().unwrap();
+                if !std::str::from_utf8(&bytes).is_ok_and(lcu::valid_puuid) {
+                    break;
+                }
+                Request::Rank(bytes)
             }
             _ => break,
         };

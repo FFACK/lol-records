@@ -37,6 +37,16 @@ pub struct Snapshot {
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Participant {
     #[serde(default)]
+    pub spells: [Option<u64>; 2],
+    #[serde(default)]
+    pub runes: [Option<u64>; 2],
+    #[serde(default)]
+    pub gold: Option<u64>,
+    #[serde(default)]
+    pub damage: Option<u64>,
+    #[serde(default)]
+    pub rank: Option<Rank>,
+    #[serde(default)]
     pub summoner_name: Option<String>,
     #[serde(default)]
     pub tag_line: Option<String>,
@@ -55,6 +65,10 @@ pub struct Participant {
 
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Detail {
+    #[serde(default)]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub context: Option<String>,
     pub game_id: u64,
     pub duration_seconds: Option<u64>,
     pub teams: Vec<u64>,
@@ -64,6 +78,13 @@ pub struct Detail {
     pub platform: Option<String>,
     #[serde(default)]
     pub account_puuid: Option<String>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct Rank {
+    pub tier: u64,
+    pub label: String,
+    pub checked_at: i64,
 }
 
 impl Detail {
@@ -89,6 +110,14 @@ impl Detail {
 
 #[derive(Deserialize, Serialize)]
 pub enum Reply {
+    Rank {
+        puuid: String,
+        rank: Option<Rank>,
+    },
+    Live {
+        phase: String,
+        detail: Option<Box<Detail>>,
+    },
     Snapshot(Box<Snapshot>),
     Detail(Box<Detail>),
     AccessDenied,
@@ -96,6 +125,9 @@ pub enum Reply {
 }
 #[derive(Clone, Copy)]
 pub enum Request {
+    Search([u8; 128]),
+    Live,
+    Rank([u8; 36]),
     Sync,
     Detail(u64),
     Profile([u8; 36]),
@@ -207,10 +239,18 @@ exit 4
                         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
             })
             .ok_or_else(|| Reply::Error("客户端尚未返回有效账号。".into()))?;
-        let rank = self.get(&format!("/lol-ranked/v1/ranked-stats/{puuid}"))?;
-        let history = self.get(&format!(
-            "/lol-match-history/v1/products/lol/{puuid}/matches?begIndex=0&endIndex=19"
-        ))?;
+        let rank = self
+            .get(&format!("/lol-ranked/v1/ranked-stats/{puuid}"))
+            .unwrap_or(Value::Null);
+        let history = self
+            .get(&format!(
+                "/lol-match-history/v1/products/lol/{puuid}/matches?begIndex=0&endIndex=19"
+            ))
+            .map_err(|_| {
+                Reply::Error(
+                    "该玩家近期战绩暂不可用，可能受接口权限、隐私设置或客户端状态限制。".into(),
+                )
+            })?;
         let games = history["games"]["games"]
             .as_array()
             .ok_or_else(|| Reply::Error("战绩返回格式与当前版本不兼容。".into()))?;
@@ -349,6 +389,17 @@ fn parse_detail(id: u64, game: &Value, account: Option<&Value>) -> Option<Detail
                     .map(str::to_owned)
             };
             Participant {
+                spells: [
+                    p["spell1Id"].as_u64().filter(|id| *id != 0),
+                    p["spell2Id"].as_u64().filter(|id| *id != 0),
+                ],
+                runes: [
+                    stats["perk0"].as_u64().filter(|id| *id != 0),
+                    stats["perkSubStyle"].as_u64().filter(|id| *id != 0),
+                ],
+                gold: stats["goldEarned"].as_u64(),
+                damage: stats["totalDamageDealtToChampions"].as_u64(),
+                rank: None,
                 summoner_name: nonempty(
                     player.and_then(|p| p.get("gameName").or_else(|| p.get("riotIdGameName"))),
                 )
@@ -394,6 +445,8 @@ fn parse_detail(id: u64, game: &Value, account: Option<&Value>) -> Option<Detail
             == 1
     });
     Some(Detail {
+        schema_version: 2,
+        context: None,
         game_id: id,
         duration_seconds: game["gameDuration"].as_u64(),
         teams,
@@ -417,6 +470,206 @@ pub fn valid_puuid(value: &str) -> bool {
             }
         })
 }
+
+pub fn search_text(bytes: &[u8; 128]) -> Option<&str> {
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    if bytes[end..].iter().any(|b| *b != 0) {
+        return None;
+    }
+    let text = std::str::from_utf8(&bytes[..end]).ok()?.trim();
+    let (name, tag) = text.rsplit_once('#')?;
+    (!name.trim().is_empty() && !tag.trim().is_empty() && !text.chars().any(char::is_control))
+        .then_some(text)
+}
+
+pub fn phase_name(phase: &str) -> &str {
+    match phase {
+        "None" => "未进入游戏",
+        "Lobby" => "大厅",
+        "Matchmaking" => "匹配中",
+        "ReadyCheck" => "等待确认",
+        "ChampSelect" => "英雄选择",
+        "GameStart" => "载入对局",
+        "InProgress" => "对局中",
+        "Reconnect" => "等待重连",
+        "WaitingForStats" | "PreEndOfGame" | "EndOfGame" => "对局结算",
+        _ => "暂不可用",
+    }
+}
+
+fn encoded(text: &str) -> String {
+    text.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+impl Session {
+    fn search(&self, bytes: [u8; 128]) -> Result<Snapshot, Reply> {
+        let text = search_text(&bytes).ok_or_else(|| {
+            Reply::Error("请输入完整的 昵称#编号（最多 128 个 UTF-8 字节）。".into())
+        })?;
+        let (name, tag) = text.rsplit_once('#').unwrap();
+        let alias = self.get(&format!(
+            "/lol-summoner/v1/alias/lookup?gameName={}&tagLine={}",
+            encoded(name.trim()),
+            encoded(tag.trim())
+        ));
+        if let Ok(alias) = alias
+            && let Some(id) = alias["puuid"].as_str().filter(|id| valid_puuid(id))
+        {
+            return self.profile(id.as_bytes().try_into().unwrap());
+        }
+        let account = self
+            .get(&format!(
+                "/lol-summoner/v1/summoners?name={}",
+                encoded(text)
+            ))
+            .map_err(|_| {
+                Reply::Error("当前大区未查询到该玩家，请检查昵称#编号及客户端登录大区。".into())
+            })?;
+        if !account["gameName"]
+            .as_str()
+            .is_some_and(|n| n.eq_ignore_ascii_case(name.trim()))
+            || !account["tagLine"]
+                .as_str()
+                .is_some_and(|t| t.eq_ignore_ascii_case(tag.trim()))
+        {
+            return Err(Reply::Error(
+                "客户端返回的 Riot ID 不匹配，请检查昵称#编号。".into(),
+            ));
+        }
+        self.profile_snapshot(account)
+    }
+
+    fn player_rank(&self, bytes: [u8; 36]) -> Option<Rank> {
+        let puuid = std::str::from_utf8(&bytes)
+            .ok()
+            .filter(|s| valid_puuid(s))?;
+        let value = self
+            .get(&format!("/lol-ranked/v1/ranked-stats/{puuid}"))
+            .ok()?;
+        parse_rank(&value)
+    }
+
+    fn live(&self) -> Result<Reply, Reply> {
+        let phase = self
+            .get("/lol-gameflow/v1/gameflow-phase")?
+            .as_str()
+            .unwrap_or("None")
+            .to_owned();
+        if !matches!(
+            phase.as_str(),
+            "ChampSelect" | "GameStart" | "InProgress" | "Reconnect"
+        ) {
+            return Ok(Reply::Live {
+                phase,
+                detail: None,
+            });
+        }
+        let selecting = phase == "ChampSelect";
+        let session = self.get(if selecting {
+            "/lol-champ-select/v1/session"
+        } else {
+            "/lol-gameflow/v1/session"
+        })?;
+        let account = self.get("/lol-summoner/v1/current-summoner").ok();
+        let detail = parse_live(&phase, &session, account.as_ref());
+        Ok(Reply::Live {
+            phase,
+            detail: detail.map(Box::new),
+        })
+    }
+}
+
+fn parse_rank(value: &Value) -> Option<Rank> {
+    let queues = value["queues"].as_array()?;
+    let row = queues
+        .iter()
+        .find(|q| q["queueType"] == "RANKED_SOLO_5x5")
+        .or_else(|| queues.iter().find(|q| q["queueType"] == "RANKED_FLEX_SR"))?;
+    let (tier, name) = match string(&row["tier"]) {
+        "IRON" => (1, "黑铁"),
+        "BRONZE" => (2, "青铜"),
+        "SILVER" => (3, "白银"),
+        "GOLD" => (4, "黄金"),
+        "PLATINUM" => (5, "铂金"),
+        "EMERALD" => (6, "翡翠"),
+        "DIAMOND" => (7, "钻石"),
+        "MASTER" => (8, "大师"),
+        "GRANDMASTER" => (9, "宗师"),
+        "CHALLENGER" => (10, "王者"),
+        "NONE" | "UNRANKED" | "" => (0, "未定级"),
+        _ => return None,
+    };
+    let queue = if row["queueType"] == "RANKED_SOLO_5x5" {
+        "单双排"
+    } else {
+        "灵活"
+    };
+    Some(Rank {
+        tier,
+        label: format!(
+            "当前{queue} {name} {} {}LP",
+            string(&row["division"]),
+            number(&row["leaguePoints"])
+        ),
+        checked_at: chrono::Local::now().timestamp_millis(),
+    })
+}
+
+fn parse_live(phase: &str, session: &Value, account: Option<&Value>) -> Option<Detail> {
+    let selecting = phase == "ChampSelect";
+    let session = if selecting {
+        session
+    } else {
+        session.get("gameData").unwrap_or(session)
+    };
+    let mut participants = Vec::new();
+    let mut identities = Vec::new();
+    for (key, team) in if selecting {
+        vec![("myTeam", 300)]
+    } else {
+        vec![("teamOne", 100), ("teamTwo", 200)]
+    } {
+        for p in session[key].as_array().into_iter().flatten() {
+            let id = participants.len() + 1;
+            // Never resolve anonymous identities from cell IDs or summoner IDs.
+            let public_name = p["gameName"]
+                .as_str()
+                .or_else(|| p["riotIdGameName"].as_str())
+                .or_else(|| p["summonerName"].as_str())
+                .is_some_and(|name| {
+                    !name.is_empty()
+                        && name != "Summoner"
+                        && !name.starts_with("Summoner ")
+                        && !name.starts_with("召唤师 ")
+                });
+            let known = public_name
+                && p["puuid"].as_str().is_some_and(valid_puuid)
+                && !p["isAnonymous"].as_bool().unwrap_or(false)
+                && p["gameName"].as_str() != Some("Summoner");
+            identities.push(serde_json::json!({"participantId":id,"player": if known { p.clone() } else { serde_json::json!({"gameName":"匿名 / 未提供身份"}) }}));
+            participants.push(serde_json::json!({"participantId":id,"teamId":team,"championId":p["championId"],"spell1Id":p["spell1Id"],"spell2Id":p["spell2Id"],"stats":{}}));
+        }
+    }
+    let mut detail = parse_detail(
+        0,
+        &serde_json::json!({"participants":participants,"participantIdentities":identities}),
+        account,
+    )?;
+    detail.context = Some(if selecting {
+        "当前选人 · 队友（仅客户端公开身份）".into()
+    } else {
+        "当前对局 · 点击玩家查看战绩".into()
+    });
+    Some(detail)
+}
 fn string(value: &Value) -> &str {
     value.as_str().unwrap_or_default()
 }
@@ -438,6 +691,12 @@ fn stats(value: &Value) -> Option<Stats> {
 }
 pub fn run(request: Request) -> Reply {
     match Session::connect().and_then(|session| match request {
+        Request::Search(bytes) => session.search(bytes).map(|s| Reply::Snapshot(Box::new(s))),
+        Request::Live => session.live(),
+        Request::Rank(bytes) => Ok(Reply::Rank {
+            puuid: String::from_utf8_lossy(&bytes).into_owned(),
+            rank: session.player_rank(bytes),
+        }),
         Request::Sync => session
             .sync()
             .map(|snapshot| Reply::Snapshot(Box::new(snapshot))),
@@ -455,6 +714,55 @@ pub fn run(request: Request) -> Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn search_validates_full_identity_and_encodes_reserved_characters() {
+        let mut bytes = [0; 128];
+        let name = "玩家 &?#12345";
+        bytes[..name.len()].copy_from_slice(name.as_bytes());
+        assert_eq!(search_text(&bytes), Some(name));
+        assert_eq!(encoded("A&B /#"), "A%26B%20%2F%23");
+        bytes[0] = 0;
+        assert!(search_text(&bytes).is_none());
+        let mut missing = [0; 128];
+        missing[..4].copy_from_slice(b"name");
+        assert!(search_text(&missing).is_none());
+        missing[0] = 255;
+        assert!(search_text(&missing).is_none());
+    }
+
+    #[test]
+    fn parses_combat_setup_without_turning_missing_stats_into_zero() {
+        let detail=parse_detail(3,&serde_json::json!({"participants":[{"participantId":1,"spell1Id":4,"spell2Id":14,"stats":{"perk0":8005,"perkSubStyle":8100,"goldEarned":0,"totalDamageDealtToChampions":23456}}]}),None).unwrap();
+        let p = &detail.participants[0];
+        assert_eq!(p.spells, [Some(4), Some(14)]);
+        assert_eq!(p.runes, [Some(8005), Some(8100)]);
+        assert_eq!(p.gold, Some(0));
+        assert_eq!(p.damage, Some(23456));
+        assert_eq!(p.kills, None);
+    }
+
+    #[test]
+    fn live_selection_excludes_opponents_and_anonymous_identifiers() {
+        let id = "12345678-1234-1234-1234-123456789abc";
+        let data = serde_json::json!({"myTeam":[{"puuid":id,"gameName":"公开","championId":22},{"puuid":id,"gameName":"匿名","isAnonymous":true}],"theirTeam":[{"puuid":id,"gameName":"对手"}]});
+        let detail = parse_live("ChampSelect", &data, None).unwrap();
+        assert_eq!(detail.participants.len(), 2);
+        assert_eq!(detail.participants[0].puuid.as_deref(), Some(id));
+        assert_eq!(detail.participants[1].puuid, None);
+        assert_eq!(detail.participants[0].kills, None);
+        assert_eq!(detail.participants[0].items, [None; 7]);
+    }
+
+    #[test]
+    fn live_ingame_reads_nested_game_data_and_rank_prefers_solo() {
+        let detail=parse_live("InProgress",&serde_json::json!({"gameData":{"teamOne":[{"championId":22}],"teamTwo":[{"championId":1}]}}),None).unwrap();
+        assert_eq!(detail.teams, [100, 200]);
+        assert_eq!(detail.participants.len(), 2);
+        let rank=parse_rank(&serde_json::json!({"queues":[{"queueType":"RANKED_FLEX_SR","tier":"CHALLENGER"},{"queueType":"RANKED_SOLO_5x5","tier":"EMERALD","division":"II","leaguePoints":37}]})).unwrap();
+        assert_eq!(rank.tier, 6);
+        assert!(rank.label.contains("当前单双排 翡翠 II 37LP"));
+        assert!(parse_rank(&serde_json::json!({})).is_none());
+    }
     use serde_json::json;
 
     #[test]

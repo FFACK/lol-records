@@ -151,6 +151,9 @@ struct Selection {
     want_query: bool,
     error: Option<String>,
     detail: DetailState,
+    live_mode: bool,
+    live: Option<Detail>,
+    live_notice: String,
 }
 
 impl Selection {
@@ -205,6 +208,12 @@ struct App {
     window: nwg::Window,
     sync: nwg::Button,
     home: nwg::Button,
+    search: nwg::TextInput,
+    search_button: nwg::Button,
+    live_button: nwg::Button,
+    rank_requested: RefCell<HashSet<String>>,
+    rank_results: RefCell<HashMap<String, lcu::Rank>>,
+    live_pending: Cell<bool>,
     own_account: RefCell<Option<String>>,
     profile_request: Cell<bool>,
     card_brush: *mut core::ffi::c_void,
@@ -346,7 +355,7 @@ impl App {
         }
         let width = dip(width as i32, dpi) as i32;
         let height = dip(height as i32, dpi) as i32;
-        let panel_height = (height - 194).max(1);
+        let panel_height = (height - 244).max(1);
         let detail_width = (width - 383).max(1);
         let place = |control, x: i32, y: i32, w: i32, h: i32| unsafe {
             MoveWindow(
@@ -364,27 +373,30 @@ impl App {
         place(self.account.handle, 44, 26, width - 370, 34);
         place(self.ranks.handle, 45, 66, width - 240, 24);
         place(self.status.handle, 45, 96, width - 240, 24);
-        place(self.matches_heading.handle, 24, 148, 160, 22);
-        place(self.detail_heading.handle, 359, 148, 150, 22);
+        place(self.search.handle, 24, 148, width - 344, 34);
+        place(self.search_button.handle, width - 308, 148, 112, 34);
+        place(self.live_button.handle, width - 184, 148, 160, 34);
+        place(self.matches_heading.handle, 24, 198, 160, 22);
+        place(self.detail_heading.handle, 359, 198, 150, 22);
         place(
             self.cache_progress.handle,
             (width - 330).max(515),
-            148,
+            198,
             306,
             22,
         );
-        place(self.list.handle, 24, 170, 320, panel_height);
+        place(self.list.handle, 24, 220, 320, panel_height);
         place(
             self.detail_frame.handle,
             359,
-            170,
+            220,
             detail_width,
             panel_height,
         );
         place(
             self.detail_text.handle,
             359,
-            170,
+            220,
             detail_width,
             panel_height,
         );
@@ -402,6 +414,9 @@ impl App {
                 self.cache_progress.set_font(Some(&font));
                 self.sync.set_font(Some(&font));
                 self.home.set_font(Some(&font));
+                self.search.set_font(Some(&font));
+                self.search_button.set_font(Some(&font));
+                self.live_button.set_font(Some(&font));
                 self.update_button.set_font(Some(&font));
                 self.list.set_font(Some(&font));
                 self.detail_text.set_font(Some(&font));
@@ -440,7 +455,7 @@ impl App {
                 .own_account
                 .borrow()
                 .as_ref()
-                .is_some_and(|own| own != &snapshot.account);
+                .map_or(self.profile_request.get(), |own| own != &snapshot.account);
             self.home.set_visible(visiting);
             self.matches_heading.set_text(if visiting {
                 "TA 的近期战绩"
@@ -502,6 +517,16 @@ impl App {
         cache: &'a Cache,
         selection: &'a Selection,
     ) -> (Option<&'a lcu::Match>, Body<'a>) {
+        if selection.live_mode {
+            return (
+                None,
+                selection
+                    .live
+                    .as_ref()
+                    .map(Body::Structured)
+                    .unwrap_or(Body::Empty(&selection.live_notice)),
+            );
+        }
         let Some(ticket) = &selection.current else {
             return (None, Body::Empty("同步账号后可查看战绩。"));
         };
@@ -570,6 +595,9 @@ impl App {
     }
 
     fn open_detail(&self) {
+        self.live_pending.set(false);
+        self.selection.borrow_mut().live_mode = false;
+        self.detail_heading.set_text("对局详情");
         if self.update_busy.get() {
             return;
         }
@@ -589,19 +617,15 @@ impl App {
             id: game.id,
         };
         let cache_key = key.cache_key();
-        let query = !cache
+        let query = cache
             .structured_details
             .get(&cache_key)
-            .is_some_and(|detail| {
-                detail
-                    .participants
-                    .iter()
-                    .any(|p| p.summoner_name.is_some())
-            })
+            .is_none_or(|detail| detail.schema_version < 2)
             && (!cache.details.contains_key(&cache_key) || self.sync.text() == "刷新战绩");
         self.selection.borrow_mut().select(Some(key), query);
         drop(cache);
         self.dispatch_detail();
+        self.schedule_ranks();
         self.refresh_detail();
         invalidate(hwnd(self.list.handle));
     }
@@ -619,12 +643,7 @@ impl App {
             .borrow()
             .structured_details
             .get(&ticket.key.cache_key())
-            .is_some_and(|detail| {
-                detail
-                    .participants
-                    .iter()
-                    .any(|p| p.summoner_name.is_some())
-            })
+            .is_some_and(|detail| detail.schema_version >= 2)
         {
             selection.complete(&ticket);
         } else if self
@@ -689,6 +708,8 @@ impl App {
         self.sync_busy.set(true);
         self.profile_request.set(true);
         self.home.set_enabled(false);
+        self.search_button.set_enabled(false);
+        self.live_button.set_enabled(false);
         self.sync.set_enabled(false);
         self.status.set_text("正在读取该召唤师的战绩…");
         if self
@@ -699,10 +720,109 @@ impl App {
             self.sync_busy.set(false);
             self.sync.set_enabled(true);
             self.home.set_enabled(true);
+            self.search_button.set_enabled(true);
+            self.live_button.set_enabled(true);
+        }
+    }
+
+    fn search_player(&self) {
+        if self.sync_busy.get() || self.update_busy.get() {
+            return;
+        }
+        let text = self.search.text();
+        let text = text.trim();
+        let mut bytes = [0; 128];
+        if text.len() > 128 {
+            self.status.set_text("昵称#编号过长，请检查输入。");
+            return;
+        }
+        bytes[..text.len()].copy_from_slice(text.as_bytes());
+        if lcu::search_text(&bytes).is_none() {
+            self.status
+                .set_text("请输入 昵称#编号，例如 玩家名字#12345（当前大区）。");
+            return;
+        }
+        self.profile_request.set(true);
+        self.start_aux(Request::Search(bytes), "正在查询玩家（当前登录大区）…");
+    }
+
+    fn show_live(&self) {
+        if self.sync_busy.get() || self.update_busy.get() {
+            return;
+        }
+        if let Some(own) = self.own_account.borrow().as_ref() {
+            let mut cache = self.cache.borrow_mut();
+            if cache.accounts.contains_key(own) {
+                cache.latest = Some(own.clone());
+            }
+        }
+        self.load_snapshot(false);
+        self.live_pending.set(true);
+        self.start_aux(Request::Live, "正在读取当前对局…");
+    }
+
+    fn start_aux(&self, request: Request, message: &str) {
+        self.sync_busy.set(true);
+        self.sync.set_enabled(false);
+        self.home.set_enabled(false);
+        self.search_button.set_enabled(false);
+        self.live_button.set_enabled(false);
+        self.status.set_text(message);
+        if self.requests.send((request, None)).is_err() {
+            self.sync_busy.set(false);
+            self.sync.set_enabled(true);
+            self.home.set_enabled(true);
+            self.search_button.set_enabled(true);
+            self.live_button.set_enabled(true);
+            self.status.set_text("查询线程已退出，请重新打开工具。");
+        }
+    }
+
+    fn hydrate_ranks(&self, detail: &mut Detail) {
+        let ranks = self.rank_results.borrow();
+        for p in &mut detail.participants {
+            if let Some(rank) = p.puuid.as_ref().and_then(|id| ranks.get(id)) {
+                p.rank = Some(rank.clone());
+            }
+        }
+    }
+
+    fn schedule_ranks(&self) {
+        let cache = self.cache.borrow();
+        let selection = self.selection.borrow();
+        let (_, body) = Self::selected(&cache, &selection);
+        if let Body::Structured(detail) = body {
+            let now = chrono::Local::now().timestamp_millis();
+            let mut requested = self.rank_requested.borrow_mut();
+            for player in &detail.participants {
+                if player
+                    .rank
+                    .as_ref()
+                    .is_some_and(|rank| now - rank.checked_at < 3600000)
+                {
+                    if let (Some(id), Some(rank)) = (&player.puuid, &player.rank) {
+                        self.rank_results
+                            .borrow_mut()
+                            .insert(id.clone(), rank.clone());
+                    }
+                    continue;
+                }
+                if let Some(id) = player.puuid.as_deref().filter(|id| lcu::valid_puuid(id))
+                    && requested.insert(id.to_owned())
+                {
+                    let _ = self
+                        .requests
+                        .send((Request::Rank(id.as_bytes().try_into().unwrap()), None));
+                }
+            }
         }
     }
 
     fn refresh_current(&self) {
+        if self.selection.borrow().live_mode {
+            self.show_live();
+            return;
+        }
         if self.sync_busy.get() || self.update_busy.get() {
             return;
         }
@@ -715,13 +835,15 @@ impl App {
             self.own_account
                 .borrow()
                 .as_ref()
-                .is_some_and(|own| own != &s.account)
+                .map_or(self.profile_request.get(), |own| own != &s.account)
         });
         if visiting && let Some(id) = id.filter(|id| lcu::valid_puuid(id)) {
             self.profile_request.set(true);
             self.sync_busy.set(true);
             self.sync.set_enabled(false);
             self.home.set_enabled(false);
+            self.search_button.set_enabled(false);
+            self.live_button.set_enabled(false);
             self.status.set_text("正在刷新该召唤师的战绩…");
             if self
                 .requests
@@ -731,6 +853,8 @@ impl App {
                 self.sync_busy.set(false);
                 self.sync.set_enabled(true);
                 self.home.set_enabled(true);
+                self.search_button.set_enabled(true);
+                self.live_button.set_enabled(true);
                 self.status.set_text("查询线程已退出，请重新打开工具。");
             }
         } else {
@@ -743,7 +867,10 @@ impl App {
             return;
         }
         self.profile_request.set(false);
+        self.selection.borrow_mut().live_mode = false;
         self.home.set_enabled(false);
+        self.search_button.set_enabled(false);
+        self.live_button.set_enabled(false);
         self.sync_busy.set(true);
         self.sync.set_enabled(false);
         self.status.set_text("正在同步游戏客户端…");
@@ -751,19 +878,46 @@ impl App {
             self.sync_busy.set(false);
             self.sync.set_enabled(true);
             self.home.set_enabled(true);
+            self.search_button.set_enabled(true);
+            self.live_button.set_enabled(true);
             self.status.set_text("查询线程已退出，请重新打开工具。");
         }
     }
 
     fn finish(&self) {
         while let Ok((ticket, reply)) = self.rx.try_recv() {
+            if let Reply::Rank { puuid, rank } = reply {
+                self.rank_requested.borrow_mut().remove(&puuid);
+                if let Some(rank) = rank {
+                    self.rank_results
+                        .borrow_mut()
+                        .insert(puuid.clone(), rank.clone());
+                    let apply = |detail: &mut Detail| {
+                        for p in &mut detail.participants {
+                            if p.puuid.as_deref() == Some(&puuid) {
+                                p.rank = Some(rank.clone());
+                            }
+                        }
+                    };
+                    for detail in self.cache.borrow_mut().structured_details.values_mut() {
+                        apply(detail);
+                    }
+                    if let Some(detail) = self.selection.borrow_mut().live.as_mut() {
+                        apply(detail);
+                    }
+                    let _ = self.cache.borrow().save();
+                    self.refresh_detail();
+                }
+                continue;
+            }
             let mut saved = false;
             let mut visible = true;
             if let Some(ticket) = ticket {
                 let mut selection = self.selection.borrow_mut();
                 visible = selection.complete(&ticket);
                 let error = match reply {
-                    Reply::Detail(detail) => {
+                    Reply::Detail(mut detail) => {
+                        self.hydrate_ranks(&mut detail);
                         saved = self.cache.borrow_mut().put_detail(
                             &ticket.key.account,
                             ticket.key.id,
@@ -792,8 +946,35 @@ impl App {
                 self.sync_busy.set(false);
                 self.sync.set_enabled(true);
                 self.home.set_enabled(true);
+                self.search_button.set_enabled(true);
+                self.live_button.set_enabled(true);
                 match reply {
+                    Reply::Live { phase, mut detail } => {
+                        if !self.live_pending.replace(false) {
+                            self.dispatch_detail();
+                            continue;
+                        }
+                        if let Some(detail) = detail.as_mut() {
+                            self.hydrate_ranks(detail);
+                        }
+                        let mut selection = self.selection.borrow_mut();
+                        selection.live_mode = true;
+                        selection.live = detail.map(|d| *d);
+                        selection.live_notice = format!(
+                            "当前阶段：{}。暂无可展示的对局成员；进入选人或对局后点击刷新。匿名身份不会被还原。",
+                            lcu::phase_name(&phase)
+                        );
+                        selection.detail.reset();
+                        drop(selection);
+                        self.home.set_visible(true);
+                        self.detail_heading.set_text("当前对局");
+                        self.status.set_text(&format!(
+                            "{} · 当前对局为手动刷新快照 · 点击玩家名称可查看战绩",
+                            lcu::phase_name(&phase)
+                        ));
+                    }
                     Reply::Snapshot(snapshot) => {
+                        self.selection.borrow_mut().live_mode = false;
                         if !self.profile_request.get() {
                             *self.own_account.borrow_mut() = Some(snapshot.account.clone());
                         }
@@ -818,6 +999,7 @@ impl App {
             if saved && self.cache.borrow().save().is_err() {
                 self.status.set_text("读取成功，本次缓存写入失败。");
             }
+            self.schedule_ranks();
             self.dispatch_detail();
             if visible {
                 self.refresh_detail();
@@ -1054,6 +1236,8 @@ impl App {
                 self.update_busy.set(false);
                 self.sync.set_enabled(true);
                 self.home.set_enabled(true);
+                self.search_button.set_enabled(true);
+                self.live_button.set_enabled(true);
                 self.update_button.set_enabled(true);
                 self.status.set_text(error);
             }
@@ -1073,6 +1257,8 @@ impl App {
         self.update_button.set_enabled(false);
         self.sync.set_enabled(false);
         self.home.set_enabled(false);
+        self.search_button.set_enabled(false);
+        self.live_button.set_enabled(false);
         self.status.set_text("正在下载并验证更新…");
         let (tx, notify) = (self.update_tx.clone(), self.update_notice.sender());
         std::thread::spawn(move || {
@@ -1115,6 +1301,13 @@ fn bind_panes(app: &Rc<App>) -> Result<Vec<nwg::RawEventHandler>, nwg::NwgError>
             let app = weak.upgrade()?;
             let color = |rgb: u32| (rgb & 0xff) << 16 | rgb & 0x00ff00 | rgb >> 16;
             match message {
+                WM_CTLCOLOREDIT if param as HWND == hwnd(app.search.handle) => {
+                    unsafe {
+                        SetTextColor(key as HWND, color(paint::TEXT));
+                        SetBkColor(key as HWND, color(paint::PANEL));
+                    }
+                    Some(app.card_brush as isize)
+                }
                 WM_ERASEBKGND if !app.header_brush.is_null() => {
                     let mut rect: RECT = unsafe { std::mem::zeroed() };
                     unsafe {
@@ -1182,6 +1375,19 @@ fn bind_panes(app: &Rc<App>) -> Result<Vec<nwg::RawEventHandler>, nwg::NwgError>
         },
     )?;
     let mut handlers = vec![header];
+    let weak = Rc::downgrade(app);
+    handlers.push(nwg::bind_raw_event_handler(
+        &app.search.handle,
+        0x10020,
+        move |_, message, key, _| {
+            if message == WM_KEYDOWN && key == 13 {
+                weak.upgrade()?.search_player();
+                return Some(0);
+            }
+            None
+        },
+    )?);
+
     for (left, control, id) in [
         (true, app.list.handle, 0x10002),
         (false, app.detail_frame.handle, 0x10003),
@@ -1196,9 +1402,15 @@ fn bind_panes(app: &Rc<App>) -> Result<Vec<nwg::RawEventHandler>, nwg::NwgError>
             },
         )?);
     }
-    for (index, control) in [app.sync.handle, app.home.handle, app.update_button.handle]
-        .into_iter()
-        .enumerate()
+    for (index, control) in [
+        app.sync.handle,
+        app.home.handle,
+        app.update_button.handle,
+        app.search_button.handle,
+        app.live_button.handle,
+    ]
+    .into_iter()
+    .enumerate()
     {
         let weak = Rc::downgrade(app);
         let target: RefCell<Option<Surface>> = RefCell::new(None);
@@ -1295,8 +1507,12 @@ fn bind_panes(app: &Rc<App>) -> Result<Vec<nwg::RawEventHandler>, nwg::NwgError>
                             }
                         } else if index == 1 {
                             "‹  回到自己".to_string()
-                        } else {
+                        } else if index == 2 {
                             app.update_button.text()
+                        } else if index == 3 {
+                            "搜索玩家".into()
+                        } else {
+                            app.live_button.text()
                         };
                         surface.text(
                             renderer,
@@ -1504,7 +1720,26 @@ fn query_worker(
     notice: nwg::NoticeSender,
 ) {
     let mut connection: Option<elevation::Connection> = None;
-    for (request, ticket) in jobs {
+    let mut foreground = std::collections::VecDeque::new();
+    let mut background = std::collections::VecDeque::new();
+    loop {
+        for job in jobs.try_iter() {
+            if matches!(job.0, Request::Rank(_)) {
+                background.push_back(job);
+            } else {
+                foreground.push_back(job);
+            }
+        }
+        let (request, ticket) =
+            if let Some(job) = foreground.pop_front().or_else(|| background.pop_front()) {
+                job
+            } else {
+                let Ok(job) = jobs.recv() else {
+                    break;
+                };
+                job
+            };
+
         let reply = if let Some(session) = &mut connection {
             match session.query(request) {
                 Ok(reply) => reply,
@@ -1527,7 +1762,7 @@ fn query_worker(
                         Err(error) => Reply::Error(error),
                     }
                 }
-                Reply::AccessDenied => Reply::Error("请点击「连接并同步」建立连接。".into()),
+                Reply::AccessDenied => Reply::Error("请点击「刷新战绩」建立连接。".into()),
                 reply => reply,
             }
         };
@@ -1576,6 +1811,12 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
         window: Default::default(),
         sync: Default::default(),
         home: Default::default(),
+        search: Default::default(),
+        search_button: Default::default(),
+        live_button: Default::default(),
+        rank_requested: Default::default(),
+        rank_results: Default::default(),
+        live_pending: Default::default(),
         own_account: Default::default(),
         profile_request: Default::default(),
         card_brush: unsafe { CreateSolidBrush(0x301f18) },
@@ -1661,6 +1902,25 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
         .parent(&app.window)
         .build(&mut app.home)?;
     app.home.set_visible(false);
+    nwg::TextInput::builder()
+        .parent(&app.window)
+        .build(&mut app.search)?;
+    let cue: Vec<u16> = "搜索当前大区玩家：昵称#编号"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    unsafe {
+        SendMessageW(hwnd(app.search.handle), 0x1501, 0, cue.as_ptr() as isize);
+    }
+    nwg::Button::builder()
+        .text("搜索玩家")
+        .parent(&app.window)
+        .build(&mut app.search_button)?;
+    nwg::Button::builder()
+        .text("当前对局 · 队友")
+        .parent(&app.window)
+        .build(&mut app.live_button)?;
+
     nwg::Button::builder()
         .text("检查更新")
         .size((122, 36))
@@ -1741,6 +2001,8 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
             OnResize | OnWindowMaximize if handle == app.window => app.layout(),
             OnButtonClick if handle == app.sync => app.refresh_current(),
             OnButtonClick if handle == app.home => app.sync(),
+            OnButtonClick if handle == app.search_button => app.search_player(),
+            OnButtonClick if handle == app.live_button => app.show_live(),
             OnListBoxSelect | OnListBoxDoubleClick if handle == app.list => app.open_detail(),
             OnNotice if handle == app.notice => app.finish(),
             OnNotice if handle == app.image_notice => app.image_arrived(),
@@ -1936,6 +2198,8 @@ mod interaction_tests {
     #[test]
     fn narrow_layout_keeps_trinket_hit_rectangle_distinct() {
         let detail = Detail {
+            schema_version: 2,
+            context: None,
             game_id: 1,
             duration_seconds: None,
             teams: vec![300],
@@ -1943,6 +2207,11 @@ mod interaction_tests {
             platform: None,
             account_puuid: None,
             participants: vec![lcu::Participant {
+                spells: [None; 2],
+                runes: [None; 2],
+                gold: None,
+                damage: None,
+                rank: None,
                 summoner_name: None,
                 tag_line: None,
                 puuid: None,

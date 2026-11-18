@@ -108,7 +108,8 @@ impl Renderer {
         let factory = self.decoder.as_ref()?;
         let side = match key {
             ImageKey::Champion(_) => 48,
-            ImageKey::Item(_) => 32,
+            ImageKey::Item(_) | ImageKey::Spell(_) | ImageKey::Rune(_) => 32,
+            ImageKey::Rank(_) => 48,
         };
         // Keep the memory alive until the stream, decoder and frame have been released.
         unsafe {
@@ -122,7 +123,7 @@ impl Renderer {
             let mut width = 0;
             let mut height = 0;
             frame.GetSize(&mut width, &mut height).ok()?;
-            if width == 0 || height == 0 || width > 512 || height > 512 {
+            if width == 0 || height == 0 || width > 2048 || height > 2048 {
                 return None;
             }
             let scaler = factory.CreateBitmapScaler().ok()?;

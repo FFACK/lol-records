@@ -14,6 +14,37 @@ static REFERENCE: LazyLock<Reference> = LazyLock::new(|| {
         .expect("valid bundled Data Dragon names")
 });
 
+#[derive(Deserialize)]
+struct CombatReference {
+    spells: HashMap<u64, (String, String)>,
+    runes: HashMap<u64, (String, String)>,
+    ranks: HashMap<u64, (String, String)>,
+}
+static COMBAT: LazyLock<CombatReference> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("combat-reference.json")).expect("valid combat metadata")
+});
+pub fn image_name(key: ImageKey) -> String {
+    match key {
+        ImageKey::Champion(id) => champion_name(id),
+        ImageKey::Item(id) => item_name(id),
+        ImageKey::Spell(id) => COMBAT
+            .spells
+            .get(&id)
+            .map(|v| v.0.clone())
+            .unwrap_or_else(|| format!("召唤师技能 #{id}")),
+        ImageKey::Rune(id) => COMBAT
+            .runes
+            .get(&id)
+            .map(|v| v.0.clone())
+            .unwrap_or_else(|| format!("符文 #{id}")),
+        ImageKey::Rank(id) => COMBAT
+            .ranks
+            .get(&id)
+            .map(|v| v.0.clone())
+            .unwrap_or_else(|| "未定级".into()),
+    }
+}
+
 pub fn champion_name(id: u64) -> String {
     REFERENCE
         .champions
@@ -184,6 +215,9 @@ pub fn portrait_client() -> ureq::Agent {
 pub enum ImageKey {
     Champion(u64),
     Item(u64),
+    Spell(u64),
+    Rune(u64),
+    Rank(u64),
 }
 
 pub fn initialization_keys() -> Vec<ImageKey> {
@@ -195,6 +229,9 @@ pub fn initialization_keys() -> Vec<ImageKey> {
         .into_iter()
         .map(ImageKey::Champion)
         .chain(items.into_iter().map(ImageKey::Item))
+        .chain(COMBAT.spells.keys().copied().map(ImageKey::Spell))
+        .chain(COMBAT.runes.keys().copied().map(ImageKey::Rune))
+        .chain(COMBAT.ranks.keys().copied().map(ImageKey::Rank))
         .collect()
 }
 
@@ -202,6 +239,9 @@ fn cache_path(key: ImageKey) -> Option<PathBuf> {
     let (folder, id) = match key {
         ImageKey::Champion(id) => ("portraits", id),
         ImageKey::Item(id) => ("items", id),
+        ImageKey::Spell(id) => ("spells", id),
+        ImageKey::Rune(id) => ("runes", id),
+        ImageKey::Rank(id) => ("ranks", id),
     };
     Some(
         PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
@@ -210,6 +250,14 @@ fn cache_path(key: ImageKey) -> Option<PathBuf> {
             .join(&REFERENCE.version)
             .join(format!("{id}.png")),
     )
+}
+
+fn image_limit(key: ImageKey) -> usize {
+    if matches!(key, ImageKey::Rune(_) | ImageKey::Rank(_)) {
+        1024 * 1024
+    } else {
+        256 * 1024
+    }
 }
 
 pub fn is_cached(key: ImageKey) -> bool {
@@ -221,7 +269,7 @@ pub fn is_cached(key: ImageKey) -> bool {
     };
     if !file
         .metadata()
-        .is_ok_and(|info| info.len() >= 8 && info.len() <= 256 * 1024)
+        .is_ok_and(|info| info.len() >= 8 && info.len() <= image_limit(key) as u64)
     {
         return false;
     }
@@ -232,37 +280,43 @@ pub fn is_cached(key: ImageKey) -> bool {
 pub fn cached_image(key: ImageKey) -> Option<Vec<u8>> {
     let file = std::fs::File::open(cache_path(key)?).ok()?;
     let mut bytes = Vec::new();
-    file.take(256 * 1024 + 1).read_to_end(&mut bytes).ok()?;
-    (bytes.len() <= 256 * 1024 && bytes.starts_with(&[137, 80, 78, 71, 13, 10, 26, 10]))
+    file.take(image_limit(key) as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= image_limit(key) && bytes.starts_with(&[137, 80, 78, 71, 13, 10, 26, 10]))
         .then_some(bytes)
 }
 
 pub fn image(agent: &ureq::Agent, key: ImageKey) -> Option<Vec<u8>> {
-    const MAX_BYTES: usize = 256 * 1024;
-    let (group, filename) = match key {
-        ImageKey::Champion(id) => ("champion", REFERENCE.champions.get(&id)?.1.clone()),
+    let max_bytes = image_limit(key);
+    let url = match key {
+        ImageKey::Champion(id) => format!(
+            "https://ddragon.leagueoflegends.com/cdn/{}/img/champion/{}",
+            REFERENCE.version,
+            REFERENCE.champions.get(&id)?.1
+        ),
         ImageKey::Item(id) => {
             REFERENCE.items.get(&id)?;
-            ("item", format!("{id}.png"))
+            format!(
+                "https://ddragon.leagueoflegends.com/cdn/{}/img/item/{id}.png",
+                REFERENCE.version
+            )
         }
+        ImageKey::Spell(id) => COMBAT.spells.get(&id)?.1.clone(),
+        ImageKey::Rune(id) => COMBAT.runes.get(&id)?.1.clone(),
+        ImageKey::Rank(id) => COMBAT.ranks.get(&id)?.1.clone(),
     };
     let path = cache_path(key);
-    let valid_png = |data: &[u8]| data.len() <= MAX_BYTES && data.starts_with(b"\x89PNG\r\n\x1a\n");
+    let valid_png = |data: &[u8]| data.len() <= max_bytes && data.starts_with(b"\x89PNG\r\n\x1a\n");
     if let Some(data) = cached_image(key) {
         return Some(data);
     }
-    let mut response = agent
-        .get(format!(
-            "https://ddragon.leagueoflegends.com/cdn/{}/img/{group}/{filename}",
-            REFERENCE.version
-        ))
-        .call()
-        .ok()?;
+    let mut response = agent.get(url).call().ok()?;
     let mut data = Vec::new();
     response
         .body_mut()
         .as_reader()
-        .take(MAX_BYTES as u64 + 1)
+        .take(max_bytes as u64 + 1)
         .read_to_end(&mut data)
         .ok()?;
     if !valid_png(&data) {
@@ -296,7 +350,11 @@ mod tests {
         assert_eq!(unique.len(), keys.len());
         assert_eq!(
             keys.len(),
-            REFERENCE.champions.len() + REFERENCE.items.len()
+            REFERENCE.champions.len()
+                + REFERENCE.items.len()
+                + COMBAT.spells.len()
+                + COMBAT.runes.len()
+                + COMBAT.ranks.len()
         );
         assert!(unique.contains(&ImageKey::Champion(22)));
         assert!(unique.contains(&ImageKey::Item(1001)));

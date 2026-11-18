@@ -30,6 +30,9 @@ Name: desktopicon; Description: "Create a desktop shortcut"; Flags: unchecked
 Source: "..\dist\lol-records.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\assets\portraits\{#AssetVersion}\*.png"; DestDir: "{localappdata}\LolRecords\portraits\{#AssetVersion}"; Flags: ignoreversion uninsneveruninstall
 Source: "..\dist\assets\items\{#AssetVersion}\*.png"; DestDir: "{localappdata}\LolRecords\items\{#AssetVersion}"; Flags: ignoreversion uninsneveruninstall
+Source: "..\dist\assets\spells\{#AssetVersion}\*.png"; DestDir: "{localappdata}\LolRecords\spells\{#AssetVersion}"; Flags: ignoreversion uninsneveruninstall
+Source: "..\dist\assets\runes\{#AssetVersion}\*.png"; DestDir: "{localappdata}\LolRecords\runes\{#AssetVersion}"; Flags: ignoreversion uninsneveruninstall
+Source: "..\dist\assets\ranks\{#AssetVersion}\*.png"; DestDir: "{localappdata}\LolRecords\ranks\{#AssetVersion}"; Flags: ignoreversion uninsneveruninstall
 [Icons]
 Name: "{autoprograms}\LoL Records"; Filename: "{app}\lol-records.exe"
 Name: "{autodesktop}\LoL Records"; Filename: "{app}\lol-records.exe"; Tasks: desktopicon

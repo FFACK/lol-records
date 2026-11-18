@@ -13,13 +13,19 @@ $jobs = @(
     foreach ($entry in $reference.items.PSObject.Properties) {
         [pscustomobject]@{ Relative = "items/$version/$($entry.Name).png"; Url = "https://ddragon.leagueoflegends.com/cdn/$version/img/item/$($entry.Name).png" }
     }
+    $combat = Get-Content (Join-Path $root 'src/combat-reference.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    foreach ($group in 'spells','runes','ranks') {
+        foreach ($entry in $combat.$group.PSObject.Properties) {
+            [pscustomobject]@{ Relative = "$group/$version/$($entry.Name).png"; Url = $entry.Value[1] }
+        }
+    }
 )
 $results = $jobs | ForEach-Object -ThrottleLimit 6 -Parallel {
     $ErrorActionPreference = 'Stop'
     function Test-Png($path) {
         if (!(Test-Path -LiteralPath $path)) { return $false }
         $bytes = [IO.File]::ReadAllBytes($path)
-        return ($bytes.Length -ge 8 -and $bytes.Length -le 262144 -and [Convert]::ToHexString($bytes[0..7]) -eq '89504E470D0A1A0A')
+        return ($bytes.Length -ge 8 -and $bytes.Length -le 1048576 -and [Convert]::ToHexString($bytes[0..7]) -eq '89504E470D0A1A0A')
     }
     $job = $_
     $target = Join-Path $using:stage $job.Relative
