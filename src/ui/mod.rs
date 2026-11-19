@@ -63,13 +63,13 @@ pub struct Slot {
 }
 
 fn name_width(_width: f32) -> f32 {
-    164.0
+    152.0
 }
 fn stats_x(_width: f32) -> f32 {
-    DETAIL_WIDTH - 240.0
+    DETAIL_WIDTH - 170.0
 }
 fn player_height(_width: f32) -> f32 {
-    82.0
+    92.0
 }
 
 impl DetailLayout {
@@ -111,7 +111,7 @@ impl DetailLayout {
                         let row_top = layout.height;
                         layout
                             .players
-                            .push((rect(70.0, row_top + 4.0, name_width(width), 37.0), index));
+                            .push((rect(82.0, row_top + 4.0, name_width(width), 37.0), index));
                         layout.push(player_height(width), RowKind::Player(index));
                         for (slot, id) in player.items.iter().enumerate() {
                             if let Some(id) = id {
@@ -163,12 +163,12 @@ impl DetailLayout {
 }
 
 fn item_rect(_width: f32, y: f32, index: usize) -> D2D_RECT_F {
-    let (left, top) = (350.0, y + 22.0);
+    let (left, top) = (374.0, y + 18.0);
     rect(
-        left + index as f32 * 31.0 + if index == 6 { 7.0 } else { 0.0 },
+        left + index as f32 * 36.0 + if index == 6 { 8.0 } else { 0.0 },
         top,
-        27.0,
-        27.0,
+        32.0,
+        32.0,
     )
 }
 
@@ -224,7 +224,7 @@ fn combat_slots(
     {
         slots.push((
             ImageKey::Rank(rank.tier),
-            rect(242.0, y + 12.0, 28.0, 28.0),
+            rect(242.0, y + 8.0, 40.0, 40.0),
             format!("{} · 查询 {}", rank.label, time(rank.checked_at)),
         ));
     }
@@ -233,7 +233,7 @@ fn combat_slots(
             let key = ImageKey::Spell(*id);
             slots.push((
                 key,
-                rect(282.0, y + 12.0 + index as f32 * 28.0, 23.0, 23.0),
+                rect(288.0, y + 8.0 + index as f32 * 36.0, 30.0, 30.0),
                 assets::image_name(key),
             ));
         }
@@ -243,7 +243,7 @@ fn combat_slots(
             let key = ImageKey::Rune(*id);
             slots.push((
                 key,
-                rect(310.0, y + 12.0 + index as f32 * 28.0, 23.0, 23.0),
+                rect(324.0, y + 8.0 + index as f32 * 36.0, 30.0, 30.0),
                 assets::image_name(key),
             ));
         }
@@ -320,7 +320,7 @@ pub fn paint_match(
     draw_image(
         surface,
         key,
-        rect(20.0, y + 12.0, 40.0, 40.0),
+        rect(18.0, y + 10.0, 44.0, 44.0),
         images,
         needed,
     );
@@ -537,13 +537,13 @@ pub fn paint_detail(
                 draw_image(
                     surface,
                     key,
-                    rect(23.0, y + 8.0, 35.0, 35.0),
+                    rect(23.0, y + 10.0, 48.0, 48.0),
                     images,
                     needed,
                 );
                 if state.player_hover == Some(*index) {
                     surface.fill(
-                        rect(65.0, y + 2.0, name_width(width) + 5.0, 41.0),
+                        rect(78.0, y + 2.0, name_width(width) + 4.0, 41.0),
                         CARD,
                         5.0,
                     );
@@ -560,7 +560,7 @@ pub fn paint_detail(
                 surface.text(
                     renderer,
                     &name,
-                    rect(70.0, y + 2.0, name_width(width), 23.0),
+                    rect(82.0, y + 2.0, name_width(width), 23.0),
                     Font::Base,
                     if player.puuid.as_deref().is_some_and(crate::lcu::valid_puuid) {
                         ACCENT
@@ -577,7 +577,7 @@ pub fn paint_detail(
                 surface.text(
                     renderer,
                     &identity,
-                    rect(70.0, y + 24.0, name_width(width), 17.0),
+                    rect(82.0, y + 24.0, name_width(width), 17.0),
                     Font::Small,
                     MUTED,
                 );
@@ -627,7 +627,7 @@ pub fn paint_detail(
                 surface.text(
                     renderer,
                     rank_label,
-                    rect(70.0, y + 57.0, 200.0, 17.0),
+                    rect(82.0, y + 69.0, 196.0, 17.0),
                     Font::Small,
                     MUTED,
                 );
@@ -713,7 +713,7 @@ mod layout_tests {
             } else {
                 reference = Some(geometry);
             }
-            assert_eq!(layout.height, DETAIL_HEADER + 34.0 + 82.0 + 10.0 + 18.0);
+            assert_eq!(layout.height, DETAIL_HEADER + 34.0 + 92.0 + 10.0 + 18.0);
             assert_eq!(layout.items.len(), 12);
             for (index, slot) in layout.items.iter().enumerate() {
                 assert!(

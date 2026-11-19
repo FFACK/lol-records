@@ -107,9 +107,9 @@ impl Renderer {
     pub fn decode(&self, key: ImageKey, bytes: &[u8]) -> Option<Pixels> {
         let factory = self.decoder.as_ref()?;
         let side = match key {
-            ImageKey::Champion(_) => 48,
-            ImageKey::Item(_) | ImageKey::Spell(_) | ImageKey::Rune(_) => 32,
-            ImageKey::Rank(_) => 48,
+            ImageKey::Champion(_) => 64,
+            ImageKey::Item(_) | ImageKey::Spell(_) | ImageKey::Rune(_) => 48,
+            ImageKey::Rank(_) => 96,
         };
         // Keep the memory alive until the stream, decoder and frame have been released.
         unsafe {
@@ -261,7 +261,9 @@ impl Surface {
     }
 
     pub fn image(&mut self, key: ImageKey, pixels: Option<&Pixels>, bounds: D2D_RECT_F) {
-        self.fill(bounds, BORDER, 5.0);
+        if pixels.is_none() && !self.bitmaps.contains_key(&key) {
+            self.border(bounds, BORDER, 4.0);
+        }
         if let std::collections::hash_map::Entry::Vacant(entry) = self.bitmaps.entry(key)
             && let Some(pixels) = pixels
         {
@@ -309,6 +311,23 @@ mod tests {
     use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 
     #[test]
+    fn transparent_png_stays_transparent_after_wic_decode() {
+        let _com =
+            crate::ComApartment(unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok());
+        let renderer = Renderer::new().unwrap();
+        let png=STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DAAAAEAQEARwbK3gAAAABJRU5ErkJggg==").unwrap();
+        let pixels = renderer.decode(ImageKey::Rank(6), &png).unwrap();
+        assert_eq!(pixels.side, 96);
+        assert!(
+            pixels
+                .bytes
+                .chunks_exact(4)
+                .all(|p| p[3] == 0 && p[..3] == [0, 0, 0]),
+            "alpha must remain transparent and premultiplied"
+        );
+    }
+
+    #[test]
     fn windows_renders_a_cached_bitmap_on_an_hwnd_target() {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, WS_POPUP,
@@ -340,7 +359,7 @@ mod tests {
         let bitmap = renderer
             .decode(key, &png)
             .expect("WIC decodes the small local PNG");
-        assert_eq!(bitmap.bytes.len(), 48 * 48 * 4);
+        assert_eq!(bitmap.bytes.len(), 64 * 64 * 4);
         surface.begin(BG);
         surface.image(key, Some(&bitmap), rect(8.0, 8.0, 40.0, 40.0));
         surface.text(

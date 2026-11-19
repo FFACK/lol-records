@@ -3,6 +3,7 @@
 mod assets;
 mod elevation;
 mod lcu;
+mod query;
 mod ui;
 mod update;
 
@@ -1734,58 +1735,7 @@ fn query_worker(
     tx: mpsc::Sender<(Option<Ticket>, Reply)>,
     notice: nwg::NoticeSender,
 ) {
-    let mut connection: Option<elevation::Connection> = None;
-    let mut foreground = std::collections::VecDeque::new();
-    let mut background = std::collections::VecDeque::new();
-    loop {
-        for job in jobs.try_iter() {
-            if matches!(job.0, Request::Rank(_)) {
-                background.push_back(job);
-            } else {
-                foreground.push_back(job);
-            }
-        }
-        let (request, ticket) =
-            if let Some(job) = foreground.pop_front().or_else(|| background.pop_front()) {
-                job
-            } else {
-                let Ok(job) = jobs.recv() else {
-                    break;
-                };
-                job
-            };
-
-        let reply = if let Some(session) = &mut connection {
-            match session.query(request) {
-                Ok(reply) => reply,
-                Err(error) => {
-                    connection = None;
-                    Reply::Error(error.into())
-                }
-            }
-        } else {
-            match lcu::run(request) {
-                Reply::AccessDenied if matches!(request, Request::Sync) => {
-                    match elevation::connect() {
-                        Ok(mut session) => match session.query(request) {
-                            Ok(reply) => {
-                                connection = Some(session);
-                                reply
-                            }
-                            Err(error) => Reply::Error(error.into()),
-                        },
-                        Err(error) => Reply::Error(error),
-                    }
-                }
-                Reply::AccessDenied => Reply::Error("请点击「刷新战绩」建立连接。".into()),
-                reply => reply,
-            }
-        };
-        if tx.send((ticket, reply)).is_err() {
-            break;
-        }
-        notice.notice();
-    }
+    query::run(jobs, tx, notice);
 }
 
 struct ComApartment(bool);

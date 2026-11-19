@@ -133,14 +133,14 @@ pub enum Request {
     Profile([u8; 36]),
 }
 
-struct Session {
+pub(crate) struct Session {
     port: u16,
     header: String,
     agent: Agent,
 }
 
 impl Session {
-    fn connect() -> Result<Self, Reply> {
+    pub(crate) fn connect() -> Result<Self, Reply> {
         let system = std::env::var_os("SystemRoot")
             .ok_or_else(|| Reply::Error("无法定位 Windows PowerShell。".into()))?;
         let shell =
@@ -202,9 +202,16 @@ exit 4
     }
 
     fn get(&self, path: &str) -> Result<Value, Reply> {
+        self.get_with_timeout(path, Duration::from_secs(8))
+    }
+
+    fn get_with_timeout(&self, path: &str, timeout: Duration) -> Result<Value, Reply> {
         self.agent
             .get(format!("https://127.0.0.1:{}{path}", self.port))
             .header("Authorization", &self.header)
+            .config()
+            .timeout_global(Some(timeout))
+            .build()
             .call()
             .and_then(|mut response| response.body_mut().read_json())
             .map_err(|error| match error {
@@ -239,18 +246,26 @@ exit 4
                         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
             })
             .ok_or_else(|| Reply::Error("客户端尚未返回有效账号。".into()))?;
-        let rank = self
-            .get(&format!("/lol-ranked/v1/ranked-stats/{puuid}"))
-            .unwrap_or(Value::Null);
-        let history = self
-            .get(&format!(
-                "/lol-match-history/v1/products/lol/{puuid}/matches?begIndex=0&endIndex=19"
-            ))
-            .map_err(|_| {
-                Reply::Error(
-                    "该玩家近期战绩暂不可用，可能受接口权限、隐私设置或客户端状态限制。".into(),
+        let (rank, history) = std::thread::scope(|scope| {
+            let rank = scope.spawn(|| {
+                self.get_with_timeout(
+                    &format!("/lol-ranked/v1/ranked-stats/{puuid}"),
+                    Duration::from_secs(2),
                 )
-            })?;
+            });
+            let history = self.get(&format!(
+                "/lol-match-history/v1/products/lol/{puuid}/matches?begIndex=0&endIndex=19"
+            ));
+            (
+                rank.join().ok().and_then(Result::ok).unwrap_or(Value::Null),
+                history,
+            )
+        });
+        let history = history.map_err(|_| {
+            Reply::Error(
+                "该玩家近期战绩暂不可用，可能受接口权限、隐私设置或客户端状态限制。".into(),
+            )
+        })?;
         let games = history["games"]["games"]
             .as_array()
             .ok_or_else(|| Reply::Error("战绩返回格式与当前版本不兼容。".into()))?;
@@ -689,25 +704,29 @@ fn stats(value: &Value) -> Option<Stats> {
             .collect(),
     })
 }
-pub fn run(request: Request) -> Reply {
-    match Session::connect().and_then(|session| match request {
-        Request::Search(bytes) => session.search(bytes).map(|s| Reply::Snapshot(Box::new(s))),
-        Request::Live => session.live(),
-        Request::Rank(bytes) => Ok(Reply::Rank {
-            puuid: String::from_utf8_lossy(&bytes).into_owned(),
-            rank: session.player_rank(bytes),
-        }),
-        Request::Sync => session
-            .sync()
-            .map(|snapshot| Reply::Snapshot(Box::new(snapshot))),
-        Request::Profile(puuid) => session
-            .profile(puuid)
-            .map(|snapshot| Reply::Snapshot(Box::new(snapshot))),
-        Request::Detail(id) => session
-            .detail(id)
-            .map(|detail| Reply::Detail(Box::new(detail))),
-    }) {
-        Ok(reply) | Err(reply) => reply,
+impl Session {
+    pub(crate) fn run(&self, request: Request) -> Reply {
+        let session = self;
+        let result = match request {
+            Request::Search(bytes) => session.search(bytes).map(|s| Reply::Snapshot(Box::new(s))),
+            Request::Live => session.live(),
+            Request::Rank(bytes) => Ok(Reply::Rank {
+                puuid: String::from_utf8_lossy(&bytes).into_owned(),
+                rank: session.player_rank(bytes),
+            }),
+            Request::Sync => session
+                .sync()
+                .map(|snapshot| Reply::Snapshot(Box::new(snapshot))),
+            Request::Profile(puuid) => session
+                .profile(puuid)
+                .map(|snapshot| Reply::Snapshot(Box::new(snapshot))),
+            Request::Detail(id) => session
+                .detail(id)
+                .map(|detail| Reply::Detail(Box::new(detail))),
+        };
+        match result {
+            Ok(reply) | Err(reply) => reply,
+        }
     }
 }
 
