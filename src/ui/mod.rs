@@ -11,6 +11,8 @@ use paint::{
 use std::collections::HashMap;
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 
+pub const CONTENT_WIDTH: f32 = 1200.0;
+pub const DETAIL_WIDTH: f32 = CONTENT_WIDTH - 383.0;
 pub const ROW_HEIGHT: f32 = 64.0;
 const DETAIL_HEADER: f32 = 118.0;
 
@@ -60,29 +62,19 @@ pub struct Slot {
     pub slot: usize,
 }
 
-fn wide_row(width: f32) -> bool {
-    width >= 840.0
+fn name_width(_width: f32) -> f32 {
+    164.0
 }
-fn name_width(width: f32) -> f32 {
-    if wide_row(width) {
-        164.0
-    } else {
-        width - 242.0
-    }
+fn stats_x(_width: f32) -> f32 {
+    DETAIL_WIDTH - 240.0
 }
-fn stats_x(width: f32) -> f32 {
-    if wide_row(width) {
-        width - 240.0
-    } else {
-        width - 166.0
-    }
-}
-fn player_height(width: f32) -> f32 {
-    if wide_row(width) { 82.0 } else { 106.0 }
+fn player_height(_width: f32) -> f32 {
+    82.0
 }
 
 impl DetailLayout {
-    pub fn new(width: f32, body: &Body<'_>) -> Self {
+    pub fn new(_viewport_width: f32, body: &Body<'_>) -> Self {
+        let width = DETAIL_WIDTH;
         let mut layout = Self {
             rows: Vec::new(),
             height: DETAIL_HEADER,
@@ -170,12 +162,8 @@ impl DetailLayout {
     }
 }
 
-fn item_rect(width: f32, y: f32, index: usize) -> D2D_RECT_F {
-    let (left, top) = if wide_row(width) {
-        (350.0, y + 22.0)
-    } else {
-        (70.0, y + 72.0)
-    };
+fn item_rect(_width: f32, y: f32, index: usize) -> D2D_RECT_F {
+    let (left, top) = (350.0, y + 22.0);
     rect(
         left + index as f32 * 31.0 + if index == 6 { 7.0 } else { 0.0 },
         top,
@@ -226,7 +214,7 @@ fn team_summary(detail: &Detail, team: Option<u64>) -> String {
     )
 }
 fn combat_slots(
-    width: f32,
+    _width: f32,
     y: f32,
     p: &crate::lcu::Participant,
 ) -> Vec<(ImageKey, D2D_RECT_F, String)> {
@@ -236,11 +224,7 @@ fn combat_slots(
     {
         slots.push((
             ImageKey::Rank(rank.tier),
-            if wide_row(width) {
-                rect(242.0, y + 12.0, 28.0, 28.0)
-            } else {
-                rect(23.0, y + 68.0, 28.0, 28.0)
-            },
+            rect(242.0, y + 12.0, 28.0, 28.0),
             format!("{} · 查询 {}", rank.label, time(rank.checked_at)),
         ));
     }
@@ -249,11 +233,7 @@ fn combat_slots(
             let key = ImageKey::Spell(*id);
             slots.push((
                 key,
-                if wide_row(width) {
-                    rect(282.0, y + 12.0 + index as f32 * 28.0, 23.0, 23.0)
-                } else {
-                    rect(width - 136.0 + index as f32 * 27.0, y + 46.0, 23.0, 23.0)
-                },
+                rect(282.0, y + 12.0 + index as f32 * 28.0, 23.0, 23.0),
                 assets::image_name(key),
             ));
         }
@@ -263,11 +243,7 @@ fn combat_slots(
             let key = ImageKey::Rune(*id);
             slots.push((
                 key,
-                if wide_row(width) {
-                    rect(310.0, y + 12.0 + index as f32 * 28.0, 23.0, 23.0)
-                } else {
-                    rect(width - 78.0 + index as f32 * 27.0, y + 46.0, 23.0, 23.0)
-                },
+                rect(310.0, y + 12.0 + index as f32 * 28.0, 23.0, 23.0),
                 assets::image_name(key),
             ));
         }
@@ -417,7 +393,8 @@ pub fn paint_detail(
     images: &HashMap<ImageKey, Pixels>,
     needed: &mut Vec<ImageKey>,
 ) {
-    let (width, height) = viewport;
+    let (_, height) = viewport;
+    let width = DETAIL_WIDTH;
     let DetailView {
         game,
         body,
@@ -633,12 +610,7 @@ pub fn paint_detail(
                 surface.text(
                     renderer,
                     &economy,
-                    rect(
-                        numbers,
-                        y + if wide_row(width) { 42.0 } else { 26.0 },
-                        width - numbers - 18.0,
-                        18.0,
-                    ),
+                    rect(numbers, y + 42.0, width - numbers - 18.0, 18.0),
                     Font::Small,
                     MUTED,
                 );
@@ -655,11 +627,7 @@ pub fn paint_detail(
                 surface.text(
                     renderer,
                     rank_label,
-                    if wide_row(width) {
-                        rect(70.0, y + 57.0, 200.0, 17.0)
-                    } else {
-                        rect(70.0, y + 48.0, (width - 256.0).max(90.0), 17.0)
-                    },
+                    rect(70.0, y + 57.0, 200.0, 17.0),
                     Font::Small,
                     MUTED,
                 );
@@ -722,10 +690,30 @@ pub fn paint_detail(
 mod layout_tests {
     use super::*;
     #[test]
-    fn player_icons_stay_disjoint_in_compact_and_wide_rows() {
+    fn player_layout_stays_fixed_and_icons_stay_disjoint_for_every_viewport() {
         let detail:Detail=serde_json::from_value(serde_json::json!({"game_id":1,"teams":[100],"participants":[{"participant_id":1,"team_id":100,"items":[1001,1002,1003,1004,1005,1006,3340],"spells":[4,14],"runes":[8005,8100],"rank":{"tier":6,"label":"当前单双排 翡翠 II 37LP","checked_at":1}}]})).unwrap();
-        for width in [380.0, 397.0, 640.0, 839.0, 840.0, 897.0] {
-            let layout = DetailLayout::new(width, &Body::Structured(&detail));
+        let mut reference = None;
+        for viewport in [380.0, 640.0, 817.0, 840.0, 1280.0, 2505.0] {
+            let width = DETAIL_WIDTH;
+            let layout = DetailLayout::new(viewport, &Body::Structured(&detail));
+            let geometry: Vec<_> = layout
+                .items
+                .iter()
+                .map(|slot| {
+                    (
+                        slot.rect.left,
+                        slot.rect.top,
+                        slot.rect.right,
+                        slot.rect.bottom,
+                    )
+                })
+                .collect();
+            if let Some(expected) = &reference {
+                assert_eq!(&geometry, expected);
+            } else {
+                reference = Some(geometry);
+            }
+            assert_eq!(layout.height, DETAIL_HEADER + 34.0 + 82.0 + 10.0 + 18.0);
             assert_eq!(layout.items.len(), 12);
             for (index, slot) in layout.items.iter().enumerate() {
                 assert!(
@@ -745,9 +733,7 @@ mod layout_tests {
                     assert!(!overlap, "overlapping icons at width {width}");
                 }
             }
-            if wide_row(width) {
-                assert!(item_rect(width, 0.0, 6).right < stats_x(width));
-            }
+            assert!(item_rect(width, 0.0, 6).right < stats_x(width));
         }
     }
 }

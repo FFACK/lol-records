@@ -312,8 +312,8 @@ fn physical(value: i32, dpi: u32) -> i32 {
 }
 
 fn content_bounds(window_width: i32) -> (i32, i32) {
-    let width = window_width.min(1280);
-    ((window_width - width) / 2, width)
+    let width = ui::CONTENT_WIDTH as i32;
+    (((window_width - width) / 2).max(0), width)
 }
 
 fn pane_size(handle: nwg::ControlHandle) -> (f32, f32) {
@@ -1880,7 +1880,7 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
     };
     let dpi = unsafe { GetDpiForSystem() }.max(96);
     nwg::Window::builder()
-        .size((physical(1120, dpi), physical(700, dpi)))
+        .size((physical(1240, dpi), physical(700, dpi)))
         .center(true)
         .title("国服战绩查询")
         .flags(nwg::WindowFlags::MAIN_WINDOW)
@@ -2034,7 +2034,7 @@ fn gui(update_ready: bool) -> Result<(), nwg::NwgError> {
             OnMinMaxInfo if handle == app.window => {
                 let (_, _, dpi) = client(hwnd(app.window.handle));
                 data.on_min_max()
-                    .set_min_size(physical(780, dpi), physical(520, dpi));
+                    .set_min_size(physical(1220, dpi), physical(520, dpi));
             }
             OnResize | OnWindowMaximize if handle == app.window => app.layout(),
             OnButtonClick if handle == app.sync => app.refresh_current(),
@@ -2209,13 +2209,13 @@ mod interaction_tests {
     }
 
     #[test]
-    fn ultrawide_windows_keep_a_centered_bounded_content_area() {
-        for window_width in [780, 1080, 1280, 1920, 2505, 3440] {
+    fn window_resize_keeps_content_width_and_only_changes_margins() {
+        for window_width in [1200, 1240, 1280, 1920, 2505, 3440] {
             let (left, width) = content_bounds(window_width);
-            assert!(width <= 1280);
+            assert_eq!(width, ui::CONTENT_WIDTH as i32);
             assert_eq!(left, (window_width - width) / 2);
             assert!(left >= 0 && left + width <= window_width);
-            assert!((width - 383) <= 897);
+            assert_eq!(width - 383, ui::DETAIL_WIDTH as i32);
         }
     }
 
@@ -2275,7 +2275,7 @@ mod interaction_tests {
                 items: [Some(1001), None, None, None, None, None, Some(3340)],
             }],
         };
-        for width in [380.0, 700.0] {
+        for width in [ui::DETAIL_WIDTH] {
             let layout = DetailLayout::new(width, &Body::Structured(&detail));
             let [boots, trinket] = layout.items.as_slice() else {
                 panic!("two populated slots")
